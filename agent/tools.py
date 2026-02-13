@@ -63,11 +63,17 @@ class ToolRunner:
         external_adapters: dict[str, ExternalAgentAdapter] | None = None,
         approval_policy: str | None = None,
         allow_dangerous_commands: bool = False,
+        strict_shell_allowlist: bool = False,
+        extra_safe_shell_prefixes: tuple[str, ...] | None = None,
+        shell_allow_prefixes: tuple[str, ...] | None = None,
     ) -> None:
         self.workdir = workdir
         self.auto_approve_safe = auto_approve_safe
         self.external_adapters = external_adapters or {}
         self.allow_dangerous_commands = allow_dangerous_commands
+        self.strict_shell_allowlist = strict_shell_allowlist
+        self.extra_safe_shell_prefixes = extra_safe_shell_prefixes or ()
+        self.shell_allow_prefixes = shell_allow_prefixes
         if approval_policy is not None:
             self.approval_policy = approval_policy
         else:
@@ -114,11 +120,21 @@ class ToolRunner:
 
     def _shell(self, command: str) -> StepResult:
         if not command.strip():
-            return StepResult(False, "Empty command.")
+            return StepResult(True, "No-op: empty shell command; replanning.")
         if _is_dangerous(command) and not self.allow_dangerous_commands:
             return StepResult(False, f"Blocked dangerous command: {command}")
 
-        needs_approval = not _is_safe_prefix(command)
+        safe_prefixes = (
+            self.shell_allow_prefixes
+            if self.shell_allow_prefixes is not None
+            else SAFE_SHELL_PREFIXES + tuple(self.extra_safe_shell_prefixes)
+        )
+        normalized = command.strip().lower()
+        is_safe = any(normalized.startswith(prefix) for prefix in safe_prefixes)
+        if self.strict_shell_allowlist and not is_safe:
+            return StepResult(False, f"Blocked by strict shell allowlist: {command}")
+
+        needs_approval = not is_safe
         if needs_approval and not self._approved(command):
             return StepResult(False, "User rejected shell command.")
 

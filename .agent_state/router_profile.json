@@ -2,6 +2,6 @@
   "escalate_after_failures": 1,
   "compress_recent_steps": 12,
   "max_external_calls": 8,
-  "updated_at": "2026-02-13T05:13:38.328929+00:00",
+  "updated_at": "2026-02-13T21:59:00.548684+00:00",
   "notes": "No significant pattern detected; keep previous settings."
 }

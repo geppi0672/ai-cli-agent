@@ -30,10 +30,27 @@ Rules:
 
 def _extract_json(raw: str) -> dict[str, Any]:
     raw = raw.strip()
-    if raw.startswith("{") and raw.endswith("}"):
-        return json.loads(raw)
+    if raw.startswith("{"):
+        try:
+            parsed, end = json.JSONDecoder().raw_decode(raw)
+            if isinstance(parsed, dict):
+                return parsed
+            raise ValueError("Top-level JSON is not an object.")
+        except Exception:
+            pass
 
-    match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+    decoder = json.JSONDecoder()
+    for idx, char in enumerate(raw):
+        if char != "{":
+            continue
+        try:
+            parsed, _ = decoder.raw_decode(raw[idx:])
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            continue
+
+    match = re.search(r"\{[\s\S]*\}", raw)
     if not match:
         raise ValueError(f"JSON not found in model output: {raw}")
     return json.loads(match.group(0))
@@ -54,7 +71,7 @@ class OpenAIProvider(PlannerProvider):
         )
         parsed: dict[str, Any] | None = None
         last_error = ""
-        for attempt in range(2):
+        for attempt in range(3):
             response = self.client.chat.completions.create(
                 model=self.model,
                 temperature=0.2,
@@ -71,7 +88,8 @@ class OpenAIProvider(PlannerProvider):
                 last_error = f"{type(exc).__name__}: {exc}"
                 user_prompt += (
                     "\n\nYour previous output was invalid JSON. "
-                    "Return only one valid JSON object with no extra text."
+                    "Return only one valid JSON object with no extra text. "
+                    "Do not include code blocks, comments, or trailing prose."
                 )
         if parsed is None:
             return AgentDecision(
