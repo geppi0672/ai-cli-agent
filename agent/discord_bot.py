@@ -415,6 +415,26 @@ def _review_status(project_root: Path) -> str:
     return "UNKNOWN"
 
 
+def _is_placeholder_commit_message(message: str) -> bool:
+    text = message.strip()
+    lower = text.lower()
+    if not text or len(text) < 6:
+        return True
+    if re.fullmatch(r"<[^>]+>", text):
+        return True
+    placeholders = {
+        "<message>",
+        "message",
+        "commit message",
+        "fix",
+        "update",
+        "wip",
+        "test",
+        "todo",
+    }
+    return lower in placeholders
+
+
 def _write_pr_ready_bundle(project_root: Path, workdir: Path) -> Path:
     release_note_path = project_root / "runs" / "release_note.md"
     review_report_path = project_root / "runs" / "review_report.md"
@@ -871,6 +891,12 @@ def main() -> int:
             return
         if not _is_git_repo(workdir):
             await ctx.reply("このworkdirはGitリポジトリではありません。`git init` 後に再実行してください。")
+            return
+        if _is_placeholder_commit_message(message):
+            await ctx.reply(
+                "コミットメッセージがダミー形式です。具体的な変更内容を書いてください。\n"
+                "例: `feat: add deliver DoD gates and PR bundle generation`"
+            )
             return
         enforce_gates = _env_bool("DISCORD_ENFORCE_APPROVE_GATES", True)
         if enforce_gates:

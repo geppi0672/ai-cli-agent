@@ -152,6 +152,7 @@ python -m agent.discord_bot --workdir /Users/tanaka/ai-cli-agent
 - `!diff` : show current `git diff` preview
 - `!approve <commit message>` : `git add -A` + `git commit`
   - 既定で `DoD=PASS` かつ `review=OK` のときのみ実行（未達はブロック）
+  - `<message>` などのダミー文言は拒否
 - `!rollback [ref]` : safe rollback via `git revert --no-edit <ref>`
 - `supervise` の tester はプロジェクト種別を自動判定し、Pythonプロジェクトでは `pytest/compileall` 系のみ許可
 
@@ -182,6 +183,13 @@ Additional runtime safeguards:
 - `pytest` 成功出力の同一反復を検知したら早期終了（無限再実行防止）
 - plannerが空/不正なtool名を連続返却したら安全停止
 - 空の `shell` コマンドは no-op として再計画扱い
+
+Git hygiene:
+
+- `.gitignore` で `runs/`, `.agent_state/`, `__pycache__/`, `*.pyc`, `.venv/`, `path/to/` などを除外
+- 既に追跡済みの生成物は一度だけ以下で追跡解除:
+  - `git rm -r --cached runs .agent_state`
+  - `git rm -r --cached -- '**/__pycache__' '*.pyc'`
 
 ## Notes
 
