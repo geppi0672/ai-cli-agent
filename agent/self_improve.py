@@ -25,6 +25,23 @@ class RunSignals:
     repeated_error_pairs: int
     max_external_used: int
     configured_max_external: int | None
+    invalid_tool_noops: int
+    noop_events: int
+    empty_shell_noops: int
+    pytest_no_tests_error_events: int
+
+
+@dataclass
+class FailurePatternProfile:
+    total_runs: int = 0
+    bad_runs: int = 0
+    invalid_tool_noops: int = 0
+    noop_events: int = 0
+    empty_shell_noops: int = 0
+    router_blocked_events: int = 0
+    pytest_no_tests_error_events: int = 0
+    updated_at: str = ""
+    notes: str = ""
 
 
 def load_router_profile(path: Path) -> RouterProfile | None:
@@ -54,7 +71,7 @@ def save_router_profile(path: Path, profile: RouterProfile) -> None:
 
 def analyze_run_log(path: Path) -> RunSignals:
     if not path.exists():
-        return RunSignals(0, 0, 0, 0, 0, 0, None)
+        return RunSignals(0, 0, 0, 0, 0, 0, None, 0, 0, 0, 0)
 
     observations: list[dict[str, Any]] = []
     for raw in path.read_text(encoding="utf-8").splitlines():
@@ -73,6 +90,10 @@ def analyze_run_log(path: Path) -> RunSignals:
     prev_fail_output = ""
     max_external_used = 0
     configured_max_external: int | None = None
+    invalid_tool_noops = 0
+    noop_events = 0
+    empty_shell_noops = 0
+    pytest_no_tests_error_events = 0
 
     for obs in observations:
         ok = bool(obs.get("ok"))
@@ -83,6 +104,16 @@ def analyze_run_log(path: Path) -> RunSignals:
         if configured is not None:
             configured_max_external = int(configured)
         max_external_used = max(max_external_used, used_external)
+        if output.startswith("no-op:"):
+            noop_events += 1
+        if "planner returned invalid tool" in output:
+            invalid_tool_noops += 1
+        if "no-op: empty shell command" in output:
+            empty_shell_noops += 1
+        if "collected 0 items" in output and (
+            "error:" in output or "file or directory not found" in output
+        ):
+            pytest_no_tests_error_events += 1
         if ok:
             streak = 0
             prev_fail_output = ""
@@ -104,6 +135,10 @@ def analyze_run_log(path: Path) -> RunSignals:
         repeated_error_pairs=repeated_error_pairs,
         max_external_used=max_external_used,
         configured_max_external=configured_max_external,
+        invalid_tool_noops=invalid_tool_noops,
+        noop_events=noop_events,
+        empty_shell_noops=empty_shell_noops,
+        pytest_no_tests_error_events=pytest_no_tests_error_events,
     )
 
 
@@ -148,3 +183,99 @@ def tune_router_profile(
         updated_at=datetime.now(UTC).isoformat(),
         notes=" ".join(notes),
     )
+
+
+def load_failure_profile(path: Path) -> FailurePatternProfile | None:
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return FailurePatternProfile(
+        total_runs=int(data.get("total_runs", 0)),
+        bad_runs=int(data.get("bad_runs", 0)),
+        invalid_tool_noops=int(data.get("invalid_tool_noops", 0)),
+        noop_events=int(data.get("noop_events", 0)),
+        empty_shell_noops=int(data.get("empty_shell_noops", 0)),
+        router_blocked_events=int(data.get("router_blocked_events", 0)),
+        pytest_no_tests_error_events=int(data.get("pytest_no_tests_error_events", 0)),
+        updated_at=str(data.get("updated_at", "")),
+        notes=str(data.get("notes", "")),
+    )
+
+
+def save_failure_profile(path: Path, profile: FailurePatternProfile) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "total_runs": profile.total_runs,
+        "bad_runs": profile.bad_runs,
+        "invalid_tool_noops": profile.invalid_tool_noops,
+        "noop_events": profile.noop_events,
+        "empty_shell_noops": profile.empty_shell_noops,
+        "router_blocked_events": profile.router_blocked_events,
+        "pytest_no_tests_error_events": profile.pytest_no_tests_error_events,
+        "updated_at": profile.updated_at,
+        "notes": profile.notes,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def tune_failure_profile(current: FailurePatternProfile, signals: RunSignals) -> FailurePatternProfile:
+    bad_run = (
+        signals.invalid_tool_noops >= 2
+        or signals.noop_events >= 3
+        or signals.router_blocked >= 2
+        or signals.pytest_no_tests_error_events >= 1
+        or signals.max_failure_streak >= 3
+    )
+
+    total_runs = current.total_runs + 1
+    bad_runs = current.bad_runs + (1 if bad_run else 0)
+    notes: list[str] = []
+    if bad_run:
+        notes.append("Detected unstable run pattern.")
+    if signals.invalid_tool_noops:
+        notes.append("Invalid-tool no-op observed.")
+    if signals.empty_shell_noops:
+        notes.append("Empty shell command observed.")
+    if signals.pytest_no_tests_error_events:
+        notes.append("Pytest no-tests with error observed.")
+    if not notes:
+        notes.append("No failure pattern escalation for this run.")
+
+    return FailurePatternProfile(
+        total_runs=total_runs,
+        bad_runs=bad_runs,
+        invalid_tool_noops=current.invalid_tool_noops + signals.invalid_tool_noops,
+        noop_events=current.noop_events + signals.noop_events,
+        empty_shell_noops=current.empty_shell_noops + signals.empty_shell_noops,
+        router_blocked_events=current.router_blocked_events + signals.router_blocked,
+        pytest_no_tests_error_events=(
+            current.pytest_no_tests_error_events + signals.pytest_no_tests_error_events
+        ),
+        updated_at=datetime.now(UTC).isoformat(),
+        notes=" ".join(notes),
+    )
+
+
+def recommend_guardrails(
+    profile: FailurePatternProfile | None,
+    max_steps: int,
+    noop_streak_limit: int,
+) -> tuple[int, int, str]:
+    if profile is None or profile.total_runs < 3:
+        return max_steps, noop_streak_limit, "guardrails: baseline"
+
+    effective_noop = noop_streak_limit if noop_streak_limit > 0 else 3
+    bad_rate = profile.bad_runs / max(1, profile.total_runs)
+    noisy_rate = (profile.noop_events + profile.invalid_tool_noops) / max(1, profile.total_runs)
+    tightened = False
+
+    if bad_rate >= 0.5:
+        max_steps = min(max_steps, 10)
+        effective_noop = min(effective_noop, 2)
+        tightened = True
+    if noisy_rate >= 2.0:
+        effective_noop = min(effective_noop, 2)
+        tightened = True
+
+    note = "guardrails: tightened from failure patterns" if tightened else "guardrails: baseline"
+    return max_steps, effective_noop, note
