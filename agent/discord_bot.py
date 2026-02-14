@@ -618,11 +618,20 @@ def _validation_commands(workdir: Path) -> list[str]:
     return []
 
 
+def _has_no_tests_signal(command: str, output: str) -> bool:
+    command_l = command.lower()
+    if "pytest" not in command_l:
+        return False
+    output_l = output.lower()
+    return "collected 0 items" in output_l or "no tests ran" in output_l
+
+
 def _run_validation_suite(workdir: Path) -> tuple[bool, str]:
     commands = _validation_commands(workdir)
     if not commands:
         return True, "No validation commands for project type."
 
+    fail_on_no_tests = _env_bool("DISCORD_FAIL_ON_NO_TESTS", True)
     lines = ["# Validation Report", ""]
     ok_all = True
     for command in commands:
@@ -640,12 +649,26 @@ def _run_validation_suite(workdir: Path) -> tuple[bool, str]:
         lines.append("")
         if code != 0:
             ok_all = False
+        if fail_on_no_tests and _has_no_tests_signal(command, out):
+            ok_all = False
+            lines.append("- policy_violation: pytest reported no tests; treated as failure")
+            lines.append("")
     return ok_all, "\n".join(lines)
 
 
 def _extract_validation_alert_lines(report_text: str) -> list[str]:
     alerts: list[str] = []
-    keywords = ("error", "failed", "warning", "traceback", "exception", "not found")
+    keywords = (
+        "error",
+        "failed",
+        "warning",
+        "traceback",
+        "exception",
+        "not found",
+        "no tests ran",
+        "collected 0 items",
+        "policy_violation",
+    )
     for raw in report_text.splitlines():
         line = raw.strip()
         if not line:

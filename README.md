@@ -170,6 +170,7 @@ DISCORD_MAX_CHANGED_FILES=25
 DISCORD_FORBIDDEN_PATH_PREFIXES=.env,.venv/,.agent_state/,runs/,path/to/,agent/__pycache__/,__pycache__/
 DISCORD_FORBIDDEN_EXTENSIONS=.pyc,.pyo,.pyd
 DISCORD_MIN_DIFF_LINES=1
+DISCORD_FAIL_ON_NO_TESTS=true
 DISCORD_ENFORCE_APPROVE_GATES=true
 DISCORD_ENFORCE_APPROVE_BRANCH=true
 ```
@@ -183,6 +184,7 @@ DISCORD_ENFORCE_APPROVE_BRANCH=true
 - `DISCORD_FORBIDDEN_PATH_PREFIXES` は DoD で禁止する変更パス接頭辞（`,` 区切り）
 - `DISCORD_FORBIDDEN_EXTENSIONS` は DoD/approve で禁止する拡張子（`,` 区切り）
 - `DISCORD_MIN_DIFF_LINES` は DoD で要求する最小差分行数（既定 `1`）
+- `DISCORD_FAIL_ON_NO_TESTS` は `pytest` の `no tests ran / collected 0 items` を検証失敗扱いにする（既定 `true`）
 - `DISCORD_ENFORCE_APPROVE_GATES` は `!approve` の DoD/Review ゲート強制（既定 `true`）
 - `DISCORD_ENFORCE_APPROVE_BRANCH` は `main/master` 直コミット拒否を有効化（既定 `true`）
 
