@@ -1,0 +1,2 @@
+"""Autonomous CLI agent MVP."""
+
