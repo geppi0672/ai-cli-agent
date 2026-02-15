@@ -141,6 +141,7 @@ python -m agent.discord_bot --workdir /Users/tanaka/ai-cli-agent
   - 許可ツールは `read_file/write_file/shell` に制限
   - `shell` は `pytest/compileall` 系のみ許可
   - `runs/validation_report.md` から失敗/警告行を抽出し、`runs/summary.md` に転記
+  - documenter は固定テンプレで `runs/summary.md` を生成（LLM迷走を抑制）
   - 成功条件は `validation all green` かつ `validation alerts=0` かつ `implementer重大停止なし` かつ `DoD=PASS`
   - さらに `review=OK` も `deliver=SUCCESS` の必須条件
   - `runs/dod_report.md` を生成（変更ファイル数上限・禁止パス変更を検査）
@@ -156,6 +157,7 @@ python -m agent.discord_bot --workdir /Users/tanaka/ai-cli-agent
 - `!approve <commit message>` : `git add -A` + `git commit`
   - 既定で `DoD=PASS` かつ `review=OK` のときのみ実行（未達はブロック）
   - `<message>` などのダミー文言は拒否
+  - 依頼文/低品質メッセージ（`type:` なし、短すぎる等）も拒否
   - 既定で `main/master` への直接コミットは拒否（ブランチ作成が必要）
   - Git `user.name` / `user.email` 未設定時は拒否
 - `!rollback [ref]` : safe rollback via `git revert --no-edit <ref>`

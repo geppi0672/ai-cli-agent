@@ -526,6 +526,36 @@ def _is_placeholder_commit_message(message: str) -> bool:
     return lower in placeholders
 
 
+def _low_quality_commit_message_reason(message: str) -> str | None:
+    text = message.strip()
+    lower = text.lower()
+    if len(text) < 10:
+        return "短すぎます。変更内容が分かる文にしてください。"
+    if len(text) > 100:
+        return "長すぎます。100文字以内に要約してください。"
+    if ":" not in text:
+        return "`type: summary` 形式を推奨します（例: `feat: tighten ...`）。"
+    request_like_tokens = (
+        "してください",
+        "してほしい",
+        "お願いします",
+        "まとめて",
+        "リサーチ",
+        "検索して",
+        "調査して",
+        "実行して",
+    )
+    if any(token in text for token in request_like_tokens):
+        return "依頼文ではなく、実装結果を要約したコミット文にしてください。"
+    valid_prefixes = ("feat:", "fix:", "chore:", "docs:", "refactor:", "test:", "perf:", "ci:", "build:")
+    if not lower.startswith(valid_prefixes):
+        return "先頭に `feat:` などの種別を付けてください。"
+    summary = text.split(":", 1)[1].strip() if ":" in text else ""
+    if len(summary) < 6:
+        return "コロン以降の要約が短すぎます。"
+    return None
+
+
 def _write_pr_ready_bundle(project_root: Path, workdir: Path) -> Path:
     release_note_path = project_root / "runs" / "release_note.md"
     review_report_path = project_root / "runs" / "review_report.md"
@@ -685,6 +715,74 @@ def _extract_validation_alert_lines(report_text: str) -> list[str]:
         if len(unique) >= 12:
             break
     return unique
+
+
+def _extract_validation_brief(report_text: str) -> list[str]:
+    brief: list[str] = []
+    for raw in report_text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        lower = line.lower()
+        if line.startswith("## Command:"):
+            brief.append(line)
+        elif line.startswith("- exit_code:"):
+            brief.append(line)
+        elif " passed in " in lower or " failed in " in lower:
+            brief.append(line)
+        if len(brief) >= 12:
+            break
+    return brief
+
+
+def _write_summary_template(
+    *,
+    workdir: Path,
+    project_root: Path,
+    objective: str,
+    impl_final: str,
+    validation_ok: bool,
+    validation_report: str,
+    alerts: list[str],
+) -> str:
+    summary_path = project_root / "runs" / "summary.md"
+    changed_files = _effective_changed_files(workdir)
+    validation_brief = _extract_validation_brief(validation_report)
+    lines = [
+        "## Objective",
+        objective,
+        "",
+        "## Changes",
+    ]
+    lines.extend([f"- {path}" for path in changed_files[:80]] or ["- (none)"])
+    lines.extend(
+        [
+            "",
+            "## Validation",
+            f"- status: {'ok' if validation_ok else 'failed'}",
+            f"- implementer: {impl_final}",
+        ]
+    )
+    lines.extend([f"- {line}" for line in validation_brief] or ["- (no validation details)"])
+    lines.extend(
+        [
+            "",
+            "## Validation Alerts",
+        ]
+    )
+    lines.extend([f"- {line}" for line in alerts] or ["- (none)"])
+    lines.extend(
+        [
+            "",
+            "## Unresolved",
+            "- (none)",
+            "",
+            "## Next Steps",
+            "- Run `!review` and confirm `status=OK` before `!approve`.",
+        ]
+    )
+    summary_path.write_text("\n".join(lines), encoding="utf-8")
+    return str(summary_path)
 
 
 def _ensure_branch(workdir: Path) -> str:
@@ -1039,6 +1137,14 @@ def main() -> int:
                 "例: `feat: add deliver DoD gates and PR bundle generation`"
             )
             return
+        low_quality_reason = _low_quality_commit_message_reason(message)
+        if low_quality_reason is not None:
+            await ctx.reply(
+                "コミットメッセージ品質チェックでブロックしました。\n"
+                f"- reason: {low_quality_reason}\n"
+                "例: `feat: tighten deliver convergence and validation guardrails`"
+            )
+            return
         files = _effective_changed_files(workdir)
         forbidden_prefixes = _forbidden_path_prefixes()
         forbidden_hits = [path for path in files if any(path.startswith(prefix) for prefix in forbidden_prefixes)]
@@ -1305,24 +1411,20 @@ def main() -> int:
                 dod_path.write_text(dod_report, encoding="utf-8")
                 progress_hook(f"validation_retry: ok={ok} attempt={attempt}")
 
-            alert_text = "\n".join(f"- {line}" for line in alerts) if alerts else "- (none)"
-            doc_objective = (
-                "以下の必須見出しで `runs/summary.md` を更新すること: "
-                "Objective, Changes, Validation, Unresolved, Next Steps. "
-                "Validationは `runs/validation_report.md` を参照して記述する。"
-                "\nさらに Validation Alerts セクションを作り、以下の抽出行を必ず転記すること:\n"
-                f"{alert_text}"
-            )
-            doc_final, doc_log, doc_note = _run_agent_job(
-                project_root=project_root,
+            summary_path = _write_summary_template(
                 workdir=workdir,
-                objective=doc_objective,
-                state=state,
-                progress_hook=lambda m: progress_hook(f"[documenter] {m}"),
-                worker_name="documenter",
+                project_root=project_root,
+                objective=objective,
+                impl_final=impl_final,
+                validation_ok=ok,
+                validation_report=report,
+                alerts=alerts,
             )
-            latest_log = doc_log
-            latest_note = doc_note
+            doc_final = (
+                "Summary template written with sections: "
+                "Objective, Changes, Validation, Validation Alerts, Unresolved, Next Steps."
+            )
+            progress_hook(f"[documenter] summary generated: {summary_path}")
 
             implementer_bad = (
                 "stopped:" in impl_final.lower()
