@@ -22,10 +22,15 @@ from .providers import OpenAIProvider
 from .router import Router
 from .runner import AgentRunner
 from .self_improve import (
+    FailurePatternProfile,
     RouterProfile,
     analyze_run_log,
     load_router_profile,
+    load_failure_profile,
+    recommend_guardrails,
+    save_failure_profile,
     save_router_profile,
+    tune_failure_profile,
     tune_router_profile,
 )
 from .supervisor import Supervisor
@@ -91,6 +96,10 @@ def _profile_path(project_root: Path) -> Path:
     return project_root / ".agent_state" / "router_profile.json"
 
 
+def _failure_profile_path(project_root: Path) -> Path:
+    return project_root / ".agent_state" / "failure_patterns.json"
+
+
 def _build_external_adapters(enable: bool) -> dict[str, ExternalAgentAdapter]:
     if not enable:
         return {}
@@ -144,6 +153,24 @@ def _run_cmd(command: str, workdir: Path) -> tuple[int, str]:
     return completed.returncode, out[:8000] if out else "(no output)"
 
 
+def _current_branch(workdir: Path) -> str:
+    code, out = _run_cmd("git rev-parse --abbrev-ref HEAD", workdir)
+    if code != 0 or not out:
+        return "unknown"
+    return out.splitlines()[-1].strip()
+
+
+def _has_git_identity(workdir: Path) -> bool:
+    name_code, name = _run_cmd("git config --get user.name", workdir)
+    email_code, email = _run_cmd("git config --get user.email", workdir)
+    return (
+        name_code == 0
+        and email_code == 0
+        and bool(name.strip())
+        and bool(email.strip())
+    )
+
+
 def _collect_changed_files(workdir: Path) -> list[str]:
     code, out = _run_cmd("git status --porcelain", workdir)
     if code != 0:
@@ -185,25 +212,78 @@ def _forbidden_path_prefixes() -> list[str]:
     raw = os.getenv("DISCORD_FORBIDDEN_PATH_PREFIXES", "").strip()
     if raw:
         return [token.strip() for token in raw.split(",") if token.strip()]
-    return [".env", ".venv/", "agent/__pycache__/", "__pycache__/"]
+    return [".env", ".venv/", ".agent_state/", "runs/", "path/to/", "agent/__pycache__/", "__pycache__/"]
+
+
+def _forbidden_extensions() -> list[str]:
+    raw = os.getenv("DISCORD_FORBIDDEN_EXTENSIONS", "").strip()
+    if raw:
+        return [token.strip().lower() for token in raw.split(",") if token.strip()]
+    return [".pyc", ".pyo", ".pyd"]
+
+
+def _forbidden_extension_hits(paths: list[str]) -> list[str]:
+    exts = _forbidden_extensions()
+    hits: list[str] = []
+    for path in paths:
+        lowered = path.lower()
+        if any(lowered.endswith(ext) for ext in exts):
+            hits.append(path)
+    return hits
+
+
+def _diff_line_counts(workdir: Path) -> tuple[int, int]:
+    code, out = _run_cmd("git diff --numstat --", workdir)
+    if code != 0 or not out:
+        return 0, 0
+    added = 0
+    removed = 0
+    for raw in out.splitlines():
+        parts = raw.split("\t")
+        if len(parts) < 3:
+            continue
+        a, d = parts[0].strip(), parts[1].strip()
+        if a.isdigit():
+            added += int(a)
+        if d.isdigit():
+            removed += int(d)
+    return added, removed
 
 
 def _evaluate_dod(workdir: Path, validation_ok: bool, alerts: list[str]) -> tuple[bool, str]:
     max_changed = max(1, _env_int("DISCORD_MAX_CHANGED_FILES", 25))
+    min_diff_lines = max(1, _env_int("DISCORD_MIN_DIFF_LINES", 1))
     files = _effective_changed_files(workdir)
+    added_lines, removed_lines = _diff_line_counts(workdir)
+    diff_lines = added_lines + removed_lines
     forbidden_prefixes = _forbidden_path_prefixes()
     forbidden_hits = [path for path in files if any(path.startswith(prefix) for prefix in forbidden_prefixes)]
+    forbidden_ext_hits = _forbidden_extension_hits(files)
     over_limit = len(files) > max_changed
     has_alerts = len(alerts) > 0
+    insufficient_diff = diff_lines < min_diff_lines
+    no_effective_changes = len(files) == 0
 
-    ok = validation_ok and not has_alerts and not forbidden_hits and not over_limit
+    ok = (
+        validation_ok
+        and not has_alerts
+        and not forbidden_hits
+        and not forbidden_ext_hits
+        and not over_limit
+        and not insufficient_diff
+        and not no_effective_changes
+    )
     lines = [
         "# DoD Report",
         "",
         f"- validation_ok: {validation_ok}",
         f"- validation_alerts: {len(alerts)}",
         f"- changed_files_count: {len(files)} (limit={max_changed})",
+        f"- diff_lines_total: {diff_lines} (min={min_diff_lines})",
         f"- forbidden_hits_count: {len(forbidden_hits)}",
+        f"- forbidden_extension_hits_count: {len(forbidden_ext_hits)}",
+        f"- insufficient_diff: {insufficient_diff}",
+        f"- no_effective_changes: {no_effective_changes}",
         f"- status: {'PASS' if ok else 'FAIL'}",
         "",
         "## Changed Files",
@@ -217,6 +297,11 @@ def _evaluate_dod(workdir: Path, validation_ok: bool, alerts: list[str]) -> tupl
         lines.extend(f"- {path}" for path in forbidden_hits[:120])
     else:
         lines.append("- (none)")
+    lines.extend(["", "## Forbidden Extension Hits"])
+    if forbidden_ext_hits:
+        lines.extend(f"- {path}" for path in forbidden_ext_hits[:120])
+    else:
+        lines.append("- (none)")
     if alerts:
         lines.extend(["", "## Validation Alerts"])
         lines.extend(f"- {line}" for line in alerts)
@@ -226,6 +311,7 @@ def _evaluate_dod(workdir: Path, validation_ok: bool, alerts: list[str]) -> tupl
 def _review_findings(workdir: Path, project_root: Path) -> str:
     files = _effective_changed_files(workdir)
     forbidden_prefixes = _forbidden_path_prefixes()
+    forbidden_exts = _forbidden_extensions()
     max_changed = max(1, _env_int("DISCORD_MAX_CHANGED_FILES", 25))
     _, diff_text = _run_cmd("git diff --", workdir)
     dod_path = project_root / "runs" / "dod_report.md"
@@ -239,6 +325,11 @@ def _review_findings(workdir: Path, project_root: Path) -> str:
     forbidden_hits = [path for path in files if any(path.startswith(prefix) for prefix in forbidden_prefixes)]
     if forbidden_hits:
         critical.append(f"Forbidden path changes: {', '.join(forbidden_hits[:8])}")
+    forbidden_ext_hits = _forbidden_extension_hits(files)
+    if forbidden_ext_hits:
+        critical.append(
+            f"Forbidden extension changes ({','.join(forbidden_exts)}): {', '.join(forbidden_ext_hits[:8])}"
+        )
     secret_hits = _detect_secret_like_additions(diff_text)
     if secret_hits:
         preview = "; ".join(secret_hits[:3])
@@ -258,7 +349,7 @@ def _review_findings(workdir: Path, project_root: Path) -> str:
     if added_lines + removed_lines > 800:
         medium.append(f"Large diff size: +{added_lines}/-{removed_lines}.")
     if "todo" in diff_text.lower() or "fixme" in diff_text.lower():
-        medium.append("Diff includes TODO/FIXME markers.")
+        high.append("Diff includes TODO/FIXME markers.")
     if dod_path.exists():
         dod = dod_path.read_text(encoding="utf-8")
         if "- status: FAIL" in dod:
@@ -445,8 +536,7 @@ def _write_pr_ready_bundle(project_root: Path, workdir: Path) -> Path:
     dod = _dod_status(project_root)
     review = _review_status(project_root)
     changed_files = _effective_changed_files(workdir)
-    branch_code, branch_out = _run_cmd("git rev-parse --abbrev-ref HEAD", workdir)
-    branch = branch_out.splitlines()[-1] if branch_code == 0 and branch_out else "unknown"
+    branch = _current_branch(workdir)
 
     lines = [
         "# PR Ready Bundle",
@@ -528,11 +618,20 @@ def _validation_commands(workdir: Path) -> list[str]:
     return []
 
 
+def _has_no_tests_signal(command: str, output: str) -> bool:
+    command_l = command.lower()
+    if "pytest" not in command_l:
+        return False
+    output_l = output.lower()
+    return "collected 0 items" in output_l or "no tests ran" in output_l
+
+
 def _run_validation_suite(workdir: Path) -> tuple[bool, str]:
     commands = _validation_commands(workdir)
     if not commands:
         return True, "No validation commands for project type."
 
+    fail_on_no_tests = _env_bool("DISCORD_FAIL_ON_NO_TESTS", True)
     lines = ["# Validation Report", ""]
     ok_all = True
     for command in commands:
@@ -550,12 +649,26 @@ def _run_validation_suite(workdir: Path) -> tuple[bool, str]:
         lines.append("")
         if code != 0:
             ok_all = False
+        if fail_on_no_tests and _has_no_tests_signal(command, out):
+            ok_all = False
+            lines.append("- policy_violation: pytest reported no tests; treated as failure")
+            lines.append("")
     return ok_all, "\n".join(lines)
 
 
 def _extract_validation_alert_lines(report_text: str) -> list[str]:
     alerts: list[str] = []
-    keywords = ("error", "failed", "warning", "traceback", "exception", "not found")
+    keywords = (
+        "error",
+        "failed",
+        "warning",
+        "traceback",
+        "exception",
+        "not found",
+        "no tests ran",
+        "collected 0 items",
+        "policy_violation",
+    )
     for raw in report_text.splitlines():
         line = raw.strip()
         if not line:
@@ -628,6 +741,13 @@ def _run_agent_job(
     config, external_adapters, profile = _build_runtime_config(project_root, workdir)
     if max_steps_override is not None:
         config.max_steps = max(1, max_steps_override)
+    failure_profile_file = _failure_profile_path(project_root)
+    failure_profile = load_failure_profile(failure_profile_file)
+    config.max_steps, effective_noop_streak_limit, guardrail_note = recommend_guardrails(
+        failure_profile,
+        config.max_steps,
+        noop_streak_limit,
+    )
     planner = OpenAIProvider(model=config.model)
     approval_policy = os.getenv("DISCORD_APPROVAL_POLICY", "allow").strip().lower() or "allow"
     strict_shell_allowlist = False
@@ -715,7 +835,7 @@ def _run_agent_job(
         on_event=on_event,
         should_stop=should_stop,
         forced_allowed_tools=forced_allowed_tools,
-        noop_streak_limit=noop_streak_limit,
+        noop_streak_limit=effective_noop_streak_limit,
     )
     final = runner.run()
     signals = analyze_run_log(memory.path)
@@ -727,10 +847,16 @@ def _run_agent_job(
     tuned_profile = tune_router_profile(base_profile, signals)
     profile_file = _profile_path(project_root)
     save_router_profile(profile_file, tuned_profile)
+    tuned_failure_profile = tune_failure_profile(
+        failure_profile or FailurePatternProfile(),
+        signals,
+    )
+    save_failure_profile(failure_profile_file, tuned_failure_profile)
     note = (
         f"next: max_external_calls={tuned_profile.max_external_calls}, "
         f"escalate_after_failures={tuned_profile.escalate_after_failures}, "
-        f"compress_recent_steps={tuned_profile.compress_recent_steps}"
+        f"compress_recent_steps={tuned_profile.compress_recent_steps}, "
+        f"guardrails={guardrail_note}"
     )
     return final, str(memory.path), note
 
@@ -892,10 +1018,36 @@ def main() -> int:
         if not _is_git_repo(workdir):
             await ctx.reply("このworkdirはGitリポジトリではありません。`git init` 後に再実行してください。")
             return
+        enforce_branch = _env_bool("DISCORD_ENFORCE_APPROVE_BRANCH", True)
+        branch = _current_branch(workdir)
+        if enforce_branch and branch in {"main", "master"}:
+            await ctx.reply(
+                "approveをブロックしました。`main/master` への直接コミットは禁止です。\n"
+                "先にブランチを切ってください。例: `git checkout -b feat/your-task`"
+            )
+            return
+        if not _has_git_identity(workdir):
+            await ctx.reply(
+                "Gitの user.name / user.email が未設定です。先に設定してください。\n"
+                "`git config --global user.name \"Your Name\"`\n"
+                "`git config --global user.email \"you@example.com\"`"
+            )
+            return
         if _is_placeholder_commit_message(message):
             await ctx.reply(
                 "コミットメッセージがダミー形式です。具体的な変更内容を書いてください。\n"
                 "例: `feat: add deliver DoD gates and PR bundle generation`"
+            )
+            return
+        files = _effective_changed_files(workdir)
+        forbidden_prefixes = _forbidden_path_prefixes()
+        forbidden_hits = [path for path in files if any(path.startswith(prefix) for prefix in forbidden_prefixes)]
+        forbidden_ext_hits = _forbidden_extension_hits(files)
+        if forbidden_hits or forbidden_ext_hits:
+            await ctx.reply(
+                "approveをブロックしました。禁止パス/拡張子の変更が残っています。\n"
+                f"- forbidden_paths: {', '.join(forbidden_hits[:8]) or 'none'}\n"
+                f"- forbidden_ext: {', '.join(forbidden_ext_hits[:8]) or 'none'}"
             )
             return
         enforce_gates = _env_bool("DISCORD_ENFORCE_APPROVE_GATES", True)
@@ -1179,7 +1331,15 @@ def main() -> int:
                 and "no-op repeated" not in impl_final.lower()
             )
             has_alerts = len(alerts) > 0
-            status = "SUCCESS" if (ok and dod_ok and not implementer_bad and not has_alerts) else "NEEDS_REVIEW"
+            review_report = _review_findings(workdir, project_root)
+            review_report_path = project_root / "runs" / "review_report.md"
+            review_report_path.write_text(review_report, encoding="utf-8")
+            review_ok = _review_status(project_root) == "OK"
+            status = (
+                "SUCCESS"
+                if (ok and dod_ok and review_ok and not implementer_bad and not has_alerts)
+                else "NEEDS_REVIEW"
+            )
             release_note = _make_release_note(
                 workdir=workdir,
                 objective=objective,
@@ -1189,9 +1349,6 @@ def main() -> int:
                 dod_report_path=dod_path,
             )
             release_note_path.write_text(release_note, encoding="utf-8")
-            review_report = _review_findings(workdir, project_root)
-            review_report_path = project_root / "runs" / "review_report.md"
-            review_report_path.write_text(review_report, encoding="utf-8")
             pr_ready_path = _write_pr_ready_bundle(project_root, workdir)
             final = (
                 f"deliver={status}\n"
@@ -1203,7 +1360,8 @@ def main() -> int:
                 f"review_report={review_report_path}\n"
                 f"pr_ready={pr_ready_path}\n"
                 f"repair_attempts={attempt}/{max_repair_loops}\n"
-                f"validation_alerts={len(alerts)}"
+                f"validation_alerts={len(alerts)}\n"
+                f"review_status={'OK' if review_ok else 'NOT_OK'}"
             )
             return final, latest_log, latest_note
 

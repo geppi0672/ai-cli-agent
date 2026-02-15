@@ -140,6 +140,7 @@ class AgentRunner:
             record = {
                 "thought": decision.thought,
                 "tool": tool,
+                "args": args,
                 "command": str(args.get("command", "")) if tool == "shell" else "",
                 "ok": result.ok,
                 "output": result.output,
@@ -183,6 +184,11 @@ class AgentRunner:
                 return final
             if _is_repeated_pytest_success(self.history, repeat_threshold=2):
                 final = "Finished: pytest success repeated; stopping redundant test loop."
+                self.memory.append({"event": "finish", "step": step, "message": final})
+                self._emit({"event": "finish", "step": step, "message": final})
+                return final
+            if _is_stalled_loop(self.history, repeat_threshold=3):
+                final = "Finished: repeated non-progress actions detected."
                 self.memory.append({"event": "finish", "step": step, "message": final})
                 self._emit({"event": "finish", "step": step, "message": final})
                 return final
@@ -234,3 +240,31 @@ def _is_repeated_pytest_success(history: list[dict], repeat_threshold: int = 2) 
         if streak >= repeat_threshold:
             return True
     return False
+
+
+def _action_signature(item: dict) -> str:
+    tool = str(item.get("tool", ""))
+    args = item.get("args", {})
+    if not isinstance(args, dict):
+        args = {}
+    if tool == "shell":
+        return f"shell:{str(args.get('command', '')).strip().lower()}"
+    if tool in {"read_file", "write_file", "append_file"}:
+        return f"{tool}:{str(args.get('path', '')).strip()}"
+    return tool
+
+
+def _is_stalled_loop(history: list[dict], repeat_threshold: int = 3) -> bool:
+    if len(history) < repeat_threshold:
+        return False
+    recent = history[-repeat_threshold:]
+    if not all(bool(item.get("ok")) for item in recent):
+        return False
+    sigs = [_action_signature(item) for item in recent]
+    if len(set(sigs)) != 1:
+        return False
+    tool = str(recent[-1].get("tool", ""))
+    if tool not in {"shell", "read_file", "git_status", "git_diff"}:
+        return False
+    outputs = [str(item.get("output", "")).strip().lower()[:220] for item in recent]
+    return len(set(outputs)) == 1
