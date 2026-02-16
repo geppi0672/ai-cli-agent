@@ -15,6 +15,7 @@ venv/
 # Local runtime / state artifacts
 runs/
 .agent_state/
+.env
 
 # Temporary or placeholder paths
 path/to/
