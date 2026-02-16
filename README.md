@@ -144,6 +144,7 @@ python -m agent.discord_bot --workdir /Users/tanaka/ai-cli-agent
   - documenter は固定テンプレで `runs/summary.md` を生成（LLM迷走を抑制）
   - 修復フェーズは失敗タイプ別に分岐（`test_failure` / `syntax_failure` / `permission_failure`）
   - 権限/認証系失敗は無限ループを避けて早期停止し、手動対応を促す
+  - 修復で差分が増えない停滞を検知し、連続時は早期停止して手動レビューへ切り替える
   - 成功条件は `validation all green` かつ `validation alerts=0` かつ `implementer重大停止なし` かつ `DoD=PASS`
   - さらに `review=OK` も `deliver=SUCCESS` の必須条件
   - `runs/dod_report.md` を生成（変更ファイル数上限・禁止パス変更を検査）

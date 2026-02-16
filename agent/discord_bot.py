@@ -250,6 +250,12 @@ def _diff_line_counts(workdir: Path) -> tuple[int, int]:
     return added, removed
 
 
+def _worktree_fingerprint(workdir: Path) -> tuple[int, int, int]:
+    files = _effective_changed_files(workdir)
+    added, removed = _diff_line_counts(workdir)
+    return len(files), added, removed
+
+
 def _evaluate_dod(workdir: Path, validation_ok: bool, alerts: list[str]) -> tuple[bool, str]:
     max_changed = max(1, _env_int("DISCORD_MAX_CHANGED_FILES", 25))
     min_diff_lines = max(1, _env_int("DISCORD_MIN_DIFF_LINES", 1))
@@ -687,7 +693,37 @@ def _run_validation_suite(workdir: Path) -> tuple[bool, str]:
 
 
 def _classify_validation_failure(report_text: str) -> str:
-    text = report_text.lower()
+    sections: list[tuple[str, int | None, str]] = []
+    current_command = ""
+    current_exit_code: int | None = None
+    body_lines: list[str] = []
+
+    for raw in report_text.splitlines():
+        line = raw.rstrip("\n")
+        if line.startswith("## Command:"):
+            if current_command:
+                sections.append((current_command, current_exit_code, "\n".join(body_lines)))
+            current_command = line.replace("## Command:", "", 1).strip().strip("`")
+            current_exit_code = None
+            body_lines = []
+            continue
+        if line.startswith("- exit_code:"):
+            value = line.split(":", 1)[1].strip()
+            try:
+                current_exit_code = int(value)
+            except ValueError:
+                current_exit_code = None
+            continue
+        body_lines.append(line)
+
+    if current_command:
+        sections.append((current_command, current_exit_code, "\n".join(body_lines)))
+
+    failing_sections = [
+        (cmd, code, body)
+        for cmd, code, body in sections
+        if (code is not None and code != 0) or "policy_violation" in body.lower()
+    ]
 
     permission_tokens = (
         "permission denied",
@@ -699,32 +735,39 @@ def _classify_validation_failure(report_text: str) -> str:
         "forbidden",
         "blocked by strict shell allowlist",
     )
-    if any(token in text for token in permission_tokens):
-        return "permission_failure"
-
     syntax_tokens = (
         "syntaxerror",
         "jsondecodeerror",
         "indentationerror",
         "nameerror",
         "typeerror",
-        "traceback",
-        "compileall",
     )
-    if any(token in text for token in syntax_tokens):
-        return "syntax_failure"
 
-    test_tokens = (
-        "pytest",
-        "failed",
-        "assert",
-        "collected",
-        "no tests ran",
-        "policy_violation: pytest reported no tests",
-    )
-    if any(token in text for token in test_tokens):
+    for command, _, body in failing_sections:
+        text = f"{command}\n{body}".lower()
+        if any(token in text for token in permission_tokens):
+            return "permission_failure"
+
+    for command, _, body in failing_sections:
+        text = f"{command}\n{body}".lower()
+        if "pytest" in command.lower() or "no tests ran" in text or "collected 0 items" in text:
+            return "test_failure"
+
+    for command, _, body in failing_sections:
+        text = f"{command}\n{body}".lower()
+        if "compileall" in command.lower() or any(token in text for token in syntax_tokens):
+            return "syntax_failure"
+
+    if failing_sections:
+        return "unknown_failure"
+
+    text = report_text.lower()
+    if any(token in text for token in permission_tokens):
+        return "permission_failure"
+    if "pytest" in text:
         return "test_failure"
-
+    if "compileall" in text or any(token in text for token in syntax_tokens):
+        return "syntax_failure"
     return "unknown_failure"
 
 
@@ -756,6 +799,22 @@ def _build_repair_objective(base_objective: str, failure_type: str) -> str:
         "以下の検証レポートに基づいて失敗を修正してください。"
         f"\nreport_path=runs/validation_report.md\nfailure_type={failure_type}\n"
         f"{strategy}\n\n{base_objective}"
+    )
+
+
+def _build_repair_objective_with_stagnation_note(
+    base_objective: str,
+    failure_type: str,
+    stagnant_repair_count: int,
+) -> str:
+    objective = _build_repair_objective(base_objective, failure_type)
+    if stagnant_repair_count <= 0:
+        return objective
+    return (
+        objective
+        + "\n追加制約: 前回までの修復で有効な差分がほぼ増えていません。"
+        " 今回は必ず `write_file` を使って最小限の修正を行い、"
+        " その後に1回だけpytest/compileallで再検証してfinishしてください。"
     )
 
 
@@ -1429,6 +1488,7 @@ def main() -> int:
             latest_note = ""
             impl_final = ""
             repair_strategies: list[str] = []
+            stagnant_repair_count = 0
             progress_hook("phase=implement")
             impl_final, impl_log, impl_note = _run_agent_job(
                 project_root=project_root,
@@ -1464,7 +1524,12 @@ def main() -> int:
                 repair_strategies.append(failure_type)
                 progress_hook(f"phase=repair attempt={attempt}")
                 progress_hook(f"repair_strategy={failure_type}")
-                fix_objective = _build_repair_objective(objective, failure_type)
+                fix_objective = _build_repair_objective_with_stagnation_note(
+                    objective,
+                    failure_type,
+                    stagnant_repair_count,
+                )
+                pre_fp = _worktree_fingerprint(workdir)
                 fix_final, fix_log, fix_note = _run_agent_job(
                     project_root=project_root,
                     workdir=workdir,
@@ -1476,6 +1541,15 @@ def main() -> int:
                     forced_allowed_tools=["read_file", "write_file", "shell", "finish"],
                     noop_streak_limit=3,
                 )
+                post_fp = _worktree_fingerprint(workdir)
+                if post_fp == pre_fp:
+                    stagnant_repair_count += 1
+                    progress_hook(
+                        "repair_progress=stagnant "
+                        f"(count={stagnant_repair_count}, fp={post_fp})"
+                    )
+                else:
+                    stagnant_repair_count = 0
                 latest_log = fix_log
                 latest_note = fix_note
                 ok, report = _run_validation_suite(workdir)
@@ -1486,6 +1560,9 @@ def main() -> int:
                 progress_hook(f"validation_retry: ok={ok} attempt={attempt}")
                 if not ok and failure_type == "permission_failure":
                     progress_hook("repair_stop=permission_failure requires manual intervention")
+                    break
+                if not ok and stagnant_repair_count >= 2:
+                    progress_hook("repair_stop=stagnant_repair detected; requires manual review")
                     break
 
             summary_path = _write_summary_template(
@@ -1540,6 +1617,7 @@ def main() -> int:
                 f"pr_ready={pr_ready_path}\n"
                 f"repair_attempts={attempt}/{max_repair_loops}\n"
                 f"repair_strategies={','.join(repair_strategies) if repair_strategies else '(none)'}\n"
+                f"repair_stagnant_count={stagnant_repair_count}\n"
                 f"validation_alerts={len(alerts)}\n"
                 f"review_status={'OK' if review_ok else 'NOT_OK'}"
             )
