@@ -686,6 +686,79 @@ def _run_validation_suite(workdir: Path) -> tuple[bool, str]:
     return ok_all, "\n".join(lines)
 
 
+def _classify_validation_failure(report_text: str) -> str:
+    text = report_text.lower()
+
+    permission_tokens = (
+        "permission denied",
+        "operation not permitted",
+        "access denied",
+        "authentication failed",
+        "could not read from remote repository",
+        "403",
+        "forbidden",
+        "blocked by strict shell allowlist",
+    )
+    if any(token in text for token in permission_tokens):
+        return "permission_failure"
+
+    syntax_tokens = (
+        "syntaxerror",
+        "jsondecodeerror",
+        "indentationerror",
+        "nameerror",
+        "typeerror",
+        "traceback",
+        "compileall",
+    )
+    if any(token in text for token in syntax_tokens):
+        return "syntax_failure"
+
+    test_tokens = (
+        "pytest",
+        "failed",
+        "assert",
+        "collected",
+        "no tests ran",
+        "policy_violation: pytest reported no tests",
+    )
+    if any(token in text for token in test_tokens):
+        return "test_failure"
+
+    return "unknown_failure"
+
+
+def _build_repair_objective(base_objective: str, failure_type: str) -> str:
+    if failure_type == "test_failure":
+        strategy = (
+            "修復戦略: テスト失敗を最優先。"
+            " failing test/exit_code を特定し、最小変更で修正し、pytestを再実行して結果を確認する。"
+            " テストが0件の場合は有効なテスト対象を指定して再実行する。"
+        )
+    elif failure_type == "syntax_failure":
+        strategy = (
+            "修復戦略: 構文/実行時エラーを最優先。"
+            " tracebackやcompileall出力の先頭エラーから順に修正し、compileall -> pytest の順で再検証する。"
+        )
+    elif failure_type == "permission_failure":
+        strategy = (
+            "修復戦略: 権限/認証エラー。"
+            " コード変更で解決できない場合が多いため、原因を明示して安全に停止し、"
+            " 必要な手動操作（認証/権限設定）を summary に残す。"
+        )
+    else:
+        strategy = (
+            "修復戦略: 汎用。"
+            " validation_report の先頭失敗コマンドを起点に原因を切り分け、"
+            " 最小変更で修正後に再検証する。"
+        )
+    return (
+        "以下の検証レポートに基づいて失敗を修正してください。"
+        f"\nreport_path=runs/validation_report.md\nfailure_type={failure_type}\n"
+        f"{strategy}\n\n{base_objective}"
+    )
+
+
 def _extract_validation_alert_lines(report_text: str) -> list[str]:
     alerts: list[str] = []
     keywords = (
@@ -1355,6 +1428,7 @@ def main() -> int:
             latest_log = ""
             latest_note = ""
             impl_final = ""
+            repair_strategies: list[str] = []
             progress_hook("phase=implement")
             impl_final, impl_log, impl_note = _run_agent_job(
                 project_root=project_root,
@@ -1386,11 +1460,11 @@ def main() -> int:
             attempt = 0
             while not ok and attempt < max_repair_loops:
                 attempt += 1
+                failure_type = _classify_validation_failure(report)
+                repair_strategies.append(failure_type)
                 progress_hook(f"phase=repair attempt={attempt}")
-                fix_objective = (
-                    "以下の検証レポートに基づいて失敗を修正してください。"
-                    f"\nreport_path=runs/validation_report.md\n\n{objective}"
-                )
+                progress_hook(f"repair_strategy={failure_type}")
+                fix_objective = _build_repair_objective(objective, failure_type)
                 fix_final, fix_log, fix_note = _run_agent_job(
                     project_root=project_root,
                     workdir=workdir,
@@ -1410,6 +1484,9 @@ def main() -> int:
                 dod_ok, dod_report = _evaluate_dod(workdir, ok, alerts)
                 dod_path.write_text(dod_report, encoding="utf-8")
                 progress_hook(f"validation_retry: ok={ok} attempt={attempt}")
+                if not ok and failure_type == "permission_failure":
+                    progress_hook("repair_stop=permission_failure requires manual intervention")
+                    break
 
             summary_path = _write_summary_template(
                 workdir=workdir,
@@ -1462,6 +1539,7 @@ def main() -> int:
                 f"review_report={review_report_path}\n"
                 f"pr_ready={pr_ready_path}\n"
                 f"repair_attempts={attempt}/{max_repair_loops}\n"
+                f"repair_strategies={','.join(repair_strategies) if repair_strategies else '(none)'}\n"
                 f"validation_alerts={len(alerts)}\n"
                 f"review_status={'OK' if review_ok else 'NOT_OK'}"
             )

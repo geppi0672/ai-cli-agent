@@ -142,6 +142,8 @@ python -m agent.discord_bot --workdir /Users/tanaka/ai-cli-agent
   - `shell` は `pytest/compileall` 系のみ許可
   - `runs/validation_report.md` から失敗/警告行を抽出し、`runs/summary.md` に転記
   - documenter は固定テンプレで `runs/summary.md` を生成（LLM迷走を抑制）
+  - 修復フェーズは失敗タイプ別に分岐（`test_failure` / `syntax_failure` / `permission_failure`）
+  - 権限/認証系失敗は無限ループを避けて早期停止し、手動対応を促す
   - 成功条件は `validation all green` かつ `validation alerts=0` かつ `implementer重大停止なし` かつ `DoD=PASS`
   - さらに `review=OK` も `deliver=SUCCESS` の必須条件
   - `runs/dod_report.md` を生成（変更ファイル数上限・禁止パス変更を検査）
