@@ -16,6 +16,7 @@ venv/
 runs/
 .agent_state/
 .env
+logs/
 
 # Temporary or placeholder paths
 path/to/

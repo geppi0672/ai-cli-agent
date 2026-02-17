@@ -1193,7 +1193,7 @@ def main() -> int:
                 progress_hook=progress_hook,
                 worker_name="autopilot",
                 max_steps_override=max(3, _env_int("DISCORD_AUTOPILOT_MAX_STEPS", 8)),
-                forced_allowed_tools=["read_file", "write_file", "shell", "finish"],
+                forced_allowed_tools=["read_file", "write_file", "finish"],
                 noop_streak_limit=2,
             )
             release_state(state, final, run_log, note)
