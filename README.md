@@ -169,6 +169,7 @@ python -m agent.discord_bot --workdir /Users/tanaka/ai-cli-agent
 - `!auto_status` : 自動実行の状態確認
 - `!auto_now` : 自動実行を1回だけ即時実行
 - autopilot は安全のため `read_file/write_file/finish` のみ使用（`shell` は禁止）
+- autopilot の書き込み先は `runs/*.md` のみに制限
 - `supervise` の tester はプロジェクト種別を自動判定し、Pythonプロジェクトでは `pytest/compileall` 系のみ許可
 
 4. Optional Discord runtime env:

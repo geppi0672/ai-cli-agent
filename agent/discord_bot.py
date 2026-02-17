@@ -1011,6 +1011,8 @@ def _run_agent_job(
     strict_shell_allowlist = False
     extra_safe_shell_prefixes: tuple[str, ...] | None = None
     shell_allow_prefixes: tuple[str, ...] | None = None
+    write_allow_prefixes: tuple[str, ...] | None = None
+    write_allow_extensions: tuple[str, ...] | None = None
     if worker_name == "tester":
         project_type = _detect_project_type(workdir)
         if project_type == "python":
@@ -1043,6 +1045,14 @@ def _run_agent_job(
             + " shellは pytest/compileall 系コマンドのみ許可。"
             + " 同じ成功結果を繰り返さず、完了したら即 finish。"
         )
+    if worker_name == "autopilot":
+        write_allow_prefixes = ("runs/",)
+        write_allow_extensions = (".md",)
+        objective = (
+            objective
+            + "\n制約: autopilot の書き込み先は runs/*.md のみ。"
+            + " それ以外のパスへは write_file/append_file を使わないこと。"
+        )
 
     tools = ToolRunner(
         workdir=config.workdir,
@@ -1053,6 +1063,8 @@ def _run_agent_job(
         strict_shell_allowlist=strict_shell_allowlist,
         extra_safe_shell_prefixes=extra_safe_shell_prefixes,
         shell_allow_prefixes=shell_allow_prefixes,
+        write_allow_prefixes=write_allow_prefixes,
+        write_allow_extensions=write_allow_extensions,
     )
     runs_dir = project_root / "runs"
     memory = JsonlMemory(output_dir=runs_dir)
