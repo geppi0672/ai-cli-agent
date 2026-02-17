@@ -164,6 +164,10 @@ python -m agent.discord_bot --workdir /Users/tanaka/ai-cli-agent
   - 既定で `main/master` への直接コミットは拒否（ブランチ作成が必要）
   - Git `user.name` / `user.email` 未設定時は拒否
 - `!rollback [ref]` : safe rollback via `git revert --no-edit <ref>`
+- `!auto_on [interval_seconds]` : 無指示時の定型タスク自動実行を開始
+- `!auto_off` : 自動実行を停止
+- `!auto_status` : 自動実行の状態確認
+- `!auto_now` : 自動実行を1回だけ即時実行
 - `supervise` の tester はプロジェクト種別を自動判定し、Pythonプロジェクトでは `pytest/compileall` 系のみ許可
 
 4. Optional Discord runtime env:
@@ -178,6 +182,9 @@ DISCORD_MIN_DIFF_LINES=1
 DISCORD_FAIL_ON_NO_TESTS=true
 DISCORD_ENFORCE_APPROVE_GATES=true
 DISCORD_ENFORCE_APPROVE_BRANCH=true
+DISCORD_AUTOPILOT_INTERVAL_SECONDS=900
+DISCORD_AUTOPILOT_MAX_STEPS=8
+DISCORD_AUTOPILOT_OBJECTIVES=リポジトリ状態を確認して runs/auto_todo.md を更新してfinish||直近runログを要約して runs/auto_health.md を更新してfinish
 ```
 
 - `allow`: non-safe shell/external calls are allowed automatically
@@ -192,6 +199,9 @@ DISCORD_ENFORCE_APPROVE_BRANCH=true
 - `DISCORD_FAIL_ON_NO_TESTS` は `pytest` の `no tests ran / collected 0 items` を検証失敗扱いにする（既定 `true`）
 - `DISCORD_ENFORCE_APPROVE_GATES` は `!approve` の DoD/Review ゲート強制（既定 `true`）
 - `DISCORD_ENFORCE_APPROVE_BRANCH` は `main/master` 直コミット拒否を有効化（既定 `true`）
+- `DISCORD_AUTOPILOT_INTERVAL_SECONDS` は autopilot 実行間隔（秒）
+- `DISCORD_AUTOPILOT_MAX_STEPS` は autopilot 1回あたりのステップ上限
+- `DISCORD_AUTOPILOT_OBJECTIVES` は autopilot の定型目標（`||` 区切り）
 
 Additional runtime safeguards:
 

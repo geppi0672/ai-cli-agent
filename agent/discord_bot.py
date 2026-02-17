@@ -52,6 +52,18 @@ class ChannelRunState:
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
+@dataclass
+class AutoPilotState:
+    enabled: bool = False
+    interval_seconds: int = 900
+    objectives: list[str] = field(default_factory=list)
+    next_index: int = 0
+    last_run_at: str = ""
+    last_final: str = ""
+    last_log: str = ""
+    task: asyncio.Task[None] | None = None
+
+
 class RunRegistry:
     def __init__(self) -> None:
         self._states: dict[int, ChannelRunState] = {}
@@ -118,6 +130,22 @@ def _load_allowed_channel_ids() -> set[int]:
         if token.isdigit():
             ids.add(int(token))
     return ids
+
+
+def _default_autopilot_objectives() -> list[str]:
+    return [
+        "リポジトリの現状を確認し、次に進める小さな改善案を最大3件 `runs/auto_todo.md` に追記して finish する。",
+        "直近 run ログを確認し、失敗傾向の要約を `runs/auto_health.md` に更新して finish する。",
+    ]
+
+
+def _load_autopilot_objectives() -> list[str]:
+    raw = os.getenv("DISCORD_AUTOPILOT_OBJECTIVES", "").strip()
+    if not raw:
+        return _default_autopilot_objectives()
+    parts = [item.strip() for item in raw.split("||")]
+    values = [item for item in parts if item]
+    return values or _default_autopilot_objectives()
 
 
 def _env_bool(key: str, default: bool) -> bool:
@@ -1107,15 +1135,102 @@ def main() -> int:
 
     allowed_channels = _load_allowed_channel_ids()
     registry = RunRegistry()
+    autopilot_states: dict[int, AutoPilotState] = {}
     intents = discord.Intents.default()
     intents.message_content = True
     bot = commands.Bot(command_prefix="!", intents=intents)
+
+    def get_autopilot_state(channel_id: int) -> AutoPilotState:
+        if channel_id not in autopilot_states:
+            autopilot_states[channel_id] = AutoPilotState(
+                enabled=False,
+                interval_seconds=max(60, _env_int("DISCORD_AUTOPILOT_INTERVAL_SECONDS", 900)),
+                objectives=_load_autopilot_objectives(),
+            )
+        return autopilot_states[channel_id]
+
+    async def _run_autopilot_once(channel_id: int, trigger: str = "timer") -> tuple[bool, str]:
+        if not is_allowed_channel(channel_id):
+            return False, "blocked channel"
+        state = registry.get(channel_id)
+        auto = get_autopilot_state(channel_id)
+        if not auto.objectives:
+            return False, "no objectives configured"
+        with state.lock:
+            if state.running:
+                return False, "already running"
+            objective = auto.objectives[auto.next_index % len(auto.objectives)]
+            auto.next_index = (auto.next_index + 1) % len(auto.objectives)
+            state.running = True
+            state.mode = "autopilot"
+            state.cancelled = False
+            state.objective = objective
+            state.step = 0
+            state.last_event = "queued"
+            state.final_message = ""
+            state.output_tail = ""
+            state.profile_note = ""
+
+        channel = bot.get_channel(channel_id)
+        if isinstance(channel, discord.abc.Messageable):
+            try:
+                await channel.send(
+                    f"autopilot開始 trigger={trigger}\nobjective={objective}"
+                )
+            except Exception:
+                pass
+
+        def progress_hook(_: str) -> None:
+            return
+
+        try:
+            final, run_log, note = await asyncio.to_thread(
+                _run_agent_job,
+                project_root=project_root,
+                workdir=workdir,
+                objective=objective,
+                state=state,
+                progress_hook=progress_hook,
+                worker_name="autopilot",
+                max_steps_override=max(3, _env_int("DISCORD_AUTOPILOT_MAX_STEPS", 8)),
+                forced_allowed_tools=["read_file", "write_file", "shell", "finish"],
+                noop_streak_limit=2,
+            )
+            release_state(state, final, run_log, note)
+            auto.last_run_at = datetime.now(UTC).isoformat()
+            auto.last_final = final
+            auto.last_log = run_log
+            if isinstance(channel, discord.abc.Messageable):
+                try:
+                    await channel.send(
+                        f"autopilot完了\nfinal={final}\nlog={run_log}\n{note}"
+                    )
+                except Exception:
+                    pass
+            return True, final
+        except Exception as exc:
+            err = f"error: {type(exc).__name__}: {exc}"
+            release_state(state, err)
+            auto.last_run_at = datetime.now(UTC).isoformat()
+            auto.last_final = err
+            if isinstance(channel, discord.abc.Messageable):
+                try:
+                    await channel.send(f"autopilotエラー: {err}")
+                except Exception:
+                    pass
+            return False, err
+
+    async def _autopilot_loop(channel_id: int) -> None:
+        auto = get_autopilot_state(channel_id)
+        while auto.enabled:
+            await _run_autopilot_once(channel_id, trigger="timer")
+            await asyncio.sleep(max(30, auto.interval_seconds))
 
     @bot.event
     async def on_ready() -> None:
         print(f"Discord bot logged in as {bot.user}", flush=True)
         print(
-            "Commands: !agent !supervise !deliver !autopr !review !status !cancel !runs !tail !diff !approve !rollback",
+            "Commands: !agent !supervise !deliver !autopr !review !status !cancel !runs !tail !diff !approve !rollback !auto_on !auto_off !auto_status !auto_now",
             flush=True,
         )
 
@@ -1190,6 +1305,56 @@ def main() -> int:
                 return
             state.cancelled = True
         await ctx.reply("キャンセル要求を受け付けました。次のステップ境界で停止します。")
+
+    @bot.command(name="auto_on")
+    async def auto_on_cmd(ctx: commands.Context, interval_seconds: int | None = None) -> None:
+        if not is_allowed_channel(ctx.channel.id):
+            return
+        auto = get_autopilot_state(ctx.channel.id)
+        if interval_seconds is not None:
+            auto.interval_seconds = max(60, interval_seconds)
+        auto.enabled = True
+        if auto.task is None or auto.task.done():
+            auto.task = asyncio.create_task(_autopilot_loop(ctx.channel.id))
+        await ctx.reply(
+            "autopilotを有効化しました。\n"
+            f"interval_seconds={auto.interval_seconds}\n"
+            f"objectives={len(auto.objectives)}"
+        )
+
+    @bot.command(name="auto_off")
+    async def auto_off_cmd(ctx: commands.Context) -> None:
+        if not is_allowed_channel(ctx.channel.id):
+            return
+        auto = get_autopilot_state(ctx.channel.id)
+        auto.enabled = False
+        if auto.task is not None:
+            auto.task.cancel()
+            auto.task = None
+        await ctx.reply("autopilotを停止しました。")
+
+    @bot.command(name="auto_status")
+    async def auto_status_cmd(ctx: commands.Context) -> None:
+        if not is_allowed_channel(ctx.channel.id):
+            return
+        auto = get_autopilot_state(ctx.channel.id)
+        await ctx.reply(
+            "autopilot状態\n"
+            f"enabled={auto.enabled}\n"
+            f"interval_seconds={auto.interval_seconds}\n"
+            f"objectives={len(auto.objectives)}\n"
+            f"last_run_at={auto.last_run_at or '(none)'}\n"
+            f"last_final={auto.last_final or '(none)'}\n"
+            f"last_log={auto.last_log or '(none)'}"
+        )
+
+    @bot.command(name="auto_now")
+    async def auto_now_cmd(ctx: commands.Context) -> None:
+        if not is_allowed_channel(ctx.channel.id):
+            return
+        ok, message = await _run_autopilot_once(ctx.channel.id, trigger="manual")
+        if not ok:
+            await ctx.reply(f"autopilot単発実行をスキップ: {message}")
 
     @bot.command(name="runs")
     async def runs_cmd(ctx: commands.Context, count: int = 5) -> None:
