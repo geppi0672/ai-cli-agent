@@ -210,6 +210,10 @@ def _env_int(key: str, default: int) -> int:
     value = os.getenv(key)
     if value is None:
         return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 def _transcribe_audio_file(path: Path) -> str:
