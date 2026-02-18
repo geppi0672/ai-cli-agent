@@ -68,6 +68,7 @@ class ToolRunner:
         shell_allow_prefixes: tuple[str, ...] | None = None,
         write_allow_prefixes: tuple[str, ...] | None = None,
         write_allow_extensions: tuple[str, ...] | None = None,
+        write_allow_paths: tuple[str, ...] | None = None,
     ) -> None:
         self.workdir = workdir
         self.auto_approve_safe = auto_approve_safe
@@ -78,6 +79,7 @@ class ToolRunner:
         self.shell_allow_prefixes = shell_allow_prefixes
         self.write_allow_prefixes = write_allow_prefixes
         self.write_allow_extensions = write_allow_extensions
+        self.write_allow_paths = write_allow_paths
         if approval_policy is not None:
             self.approval_policy = approval_policy
         else:
@@ -196,6 +198,10 @@ class ToolRunner:
         normalized = rel_path.strip().replace("\\", "/")
         if normalized.startswith("./"):
             normalized = normalized[2:]
+        if self.write_allow_paths is not None:
+            allowed_exact = {item.strip().replace("\\", "/") for item in self.write_allow_paths}
+            if normalized not in allowed_exact:
+                return False
         if self.write_allow_prefixes is not None:
             if not any(normalized.startswith(prefix) for prefix in self.write_allow_prefixes):
                 return False

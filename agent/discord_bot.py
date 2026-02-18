@@ -925,6 +925,28 @@ def _run_validation_suite(workdir: Path) -> tuple[bool, str]:
     return ok_all, "\n".join(lines)
 
 
+def _has_no_tests_signal_in_text(text: str) -> bool:
+    lowered = text.lower()
+    return "collected 0 items" in lowered or "no tests ran" in lowered
+
+
+def _detect_no_tests_in_runlog(run_log_path: str) -> bool:
+    path = Path(run_log_path)
+    if not path.exists():
+        return False
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(raw)
+        except Exception:
+            continue
+        if row.get("event") != "observation":
+            continue
+        output = str(row.get("output", ""))
+        if _has_no_tests_signal_in_text(output):
+            return True
+    return False
+
+
 def _classify_validation_failure(report_text: str) -> str:
     sections: list[tuple[str, int | None, str]] = []
     current_command = ""
@@ -1218,6 +1240,7 @@ def _run_agent_job(
     shell_allow_prefixes: tuple[str, ...] | None = None
     write_allow_prefixes: tuple[str, ...] | None = None
     write_allow_extensions: tuple[str, ...] | None = None
+    write_allow_paths: tuple[str, ...] | None = None
     if worker_name == "tester":
         project_type = _detect_project_type(workdir)
         if project_type == "python":
@@ -1253,9 +1276,10 @@ def _run_agent_job(
     if worker_name == "autopilot":
         write_allow_prefixes = ("runs/",)
         write_allow_extensions = (".md",)
+        write_allow_paths = ("runs/auto_todo.md", "runs/auto_health.md")
         objective = (
             objective
-            + "\n制約: autopilot の書き込み先は runs/*.md のみ。"
+            + "\n制約: autopilot の書き込み先は `runs/auto_todo.md` と `runs/auto_health.md` のみ。"
             + " それ以外のパスへは write_file/append_file を使わないこと。"
         )
 
@@ -1270,6 +1294,7 @@ def _run_agent_job(
         shell_allow_prefixes=shell_allow_prefixes,
         write_allow_prefixes=write_allow_prefixes,
         write_allow_extensions=write_allow_extensions,
+        write_allow_paths=write_allow_paths,
     )
     runs_dir = project_root / "runs"
     memory = JsonlMemory(output_dir=runs_dir)
@@ -2045,6 +2070,9 @@ def main() -> int:
             ok, report = _run_validation_suite(workdir)
             validation_path.write_text(report, encoding="utf-8")
             alerts = _extract_validation_alert_lines(report)
+            if _detect_no_tests_in_runlog(impl_log):
+                alerts.append("implement_phase_no_tests_detected")
+                ok = False
             dod_ok, dod_report = _evaluate_dod(workdir, ok, alerts)
             dod_path.write_text(dod_report, encoding="utf-8")
             progress_hook(f"validation: ok={ok} report={validation_path}")
@@ -2095,6 +2123,9 @@ def main() -> int:
                 ok, report = _run_validation_suite(workdir)
                 validation_path.write_text(report, encoding="utf-8")
                 alerts = _extract_validation_alert_lines(report)
+                if _detect_no_tests_in_runlog(fix_log):
+                    alerts.append("repair_phase_no_tests_detected")
+                    ok = False
                 dod_ok, dod_report = _evaluate_dod(workdir, ok, alerts)
                 dod_path.write_text(dod_report, encoding="utf-8")
                 progress_hook(f"validation_retry: ok={ok} attempt={attempt}")

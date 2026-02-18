@@ -172,7 +172,7 @@ python -m agent.discord_bot --workdir /Users/tanaka/ai-cli-agent
 - `!auto_daily` : 日次サマリ (`runs/daily_summary.md`) を即時生成
 - `!voice [agent|deliver|supervise]` : 添付音声を文字起こしして、そのまま指定モードで実行
 - autopilot は安全のため `read_file/write_file/finish` のみ使用（`shell` は禁止）
-- autopilot の書き込み先は `runs/*.md` のみに制限
+- autopilot の書き込み先は `runs/auto_todo.md` と `runs/auto_health.md` のみに制限
 - autopilot 失敗時は `runs/manual_checklist.md` を自動生成
 - autopilot 実行履歴は `.agent_state/autopilot_history.jsonl` に保存
 - autopilot 変更にもガードレポート (`runs/autopilot_guard_report.md`) を適用
@@ -224,6 +224,7 @@ DISCORD_REPAIR_UNKNOWN_MAX_ATTEMPTS=2
 - `OPENAI_TRANSCRIBE_MODEL` は音声文字起こしモデル（既定: `gpt-4o-mini-transcribe`）
 - `DISCORD_VOICE_MAX_MB` は音声添付サイズ上限（MB）
 - `DISCORD_REPAIR_*_MAX_ATTEMPTS` は失敗タイプ別の修復試行上限
+- implement/repair フェーズで `no tests ran / collected 0 items` が出た場合は `deliver` を失敗側に倒す
 
 Additional runtime safeguards:
 
