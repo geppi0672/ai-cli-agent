@@ -1,1 +1,29 @@
-The current directory contains the following files and folders: ...
+# Non-Code Summary
+
+Generated At: 2026-02-18T10:10:14.558535+00:00
+Objective: リサーチ内容をまとめて
+Source: runs/day_plan.md
+
+Reliability: medium
+
+## Citations (Required)
+- url: unknown | date: unknown | reliability: low
+
+## Facts
+- [fact] # Day Plan
+- [fact] created_at: 2026-02-18T05:45:03.214568+00:00
+- [fact] objective: を作って
+
+## Inferences
+- [inference] 要点3つのうち最優先1件を実行タスク化して進める。
+
+## Key Points
+- # Day Plan
+- created_at: 2026-02-18T05:45:03.214568+00:00
+- objective: を作って
+
+## Unresolved
+- 一次ソース確認が未完了。必要なら原文・URL・日付を追記してください。
+
+## Next Action
+- 要点3つのうち最優先1件を実行タスク化して進める。
