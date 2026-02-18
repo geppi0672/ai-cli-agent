@@ -66,6 +66,9 @@ class ToolRunner:
         strict_shell_allowlist: bool = False,
         extra_safe_shell_prefixes: tuple[str, ...] | None = None,
         shell_allow_prefixes: tuple[str, ...] | None = None,
+        write_allow_prefixes: tuple[str, ...] | None = None,
+        write_allow_extensions: tuple[str, ...] | None = None,
+        write_allow_paths: tuple[str, ...] | None = None,
     ) -> None:
         self.workdir = workdir
         self.auto_approve_safe = auto_approve_safe
@@ -74,6 +77,9 @@ class ToolRunner:
         self.strict_shell_allowlist = strict_shell_allowlist
         self.extra_safe_shell_prefixes = extra_safe_shell_prefixes or ()
         self.shell_allow_prefixes = shell_allow_prefixes
+        self.write_allow_prefixes = write_allow_prefixes
+        self.write_allow_extensions = write_allow_extensions
+        self.write_allow_paths = write_allow_paths
         if approval_policy is not None:
             self.approval_policy = approval_policy
         else:
@@ -172,17 +178,38 @@ class ToolRunner:
         return StepResult(True, text[:6000])
 
     def _write_file(self, rel_path: str, content: str) -> StepResult:
+        if not self._is_write_path_allowed(rel_path):
+            return StepResult(False, f"Blocked write path policy: {rel_path}")
         path = _resolve_path(self.workdir, rel_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         return StepResult(True, f"Wrote {rel_path} ({len(content)} chars).")
 
     def _append_file(self, rel_path: str, content: str) -> StepResult:
+        if not self._is_write_path_allowed(rel_path):
+            return StepResult(False, f"Blocked write path policy: {rel_path}")
         path = _resolve_path(self.workdir, rel_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as f:
             f.write(content)
         return StepResult(True, f"Appended {len(content)} chars to {rel_path}.")
+
+    def _is_write_path_allowed(self, rel_path: str) -> bool:
+        normalized = rel_path.strip().replace("\\", "/")
+        if normalized.startswith("./"):
+            normalized = normalized[2:]
+        if self.write_allow_paths is not None:
+            allowed_exact = {item.strip().replace("\\", "/") for item in self.write_allow_paths}
+            if normalized not in allowed_exact:
+                return False
+        if self.write_allow_prefixes is not None:
+            if not any(normalized.startswith(prefix) for prefix in self.write_allow_prefixes):
+                return False
+        if self.write_allow_extensions is not None:
+            lowered = normalized.lower()
+            if not any(lowered.endswith(ext.lower()) for ext in self.write_allow_extensions):
+                return False
+        return True
 
     def _run_external(self, tool: str, args: dict) -> StepResult:
         instruction = str(args.get("instruction", "")).strip()

@@ -15,9 +15,14 @@ venv/
 # Local runtime / state artifacts
 runs/
 .agent_state/
+.env
+logs/
 
 # Temporary or placeholder paths
 path/to/
 
 # OS/editor noise
 .DS_Store
+
+# Accidental top-level reports
+DoD_report.txt

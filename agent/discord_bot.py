@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import re
 import subprocess
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -12,6 +14,7 @@ from pathlib import Path
 
 import discord
 from discord.ext import commands
+from openai import OpenAI
 
 from .adapters import AntigravityAdapter, CodexAdapter, ExternalAgentAdapter
 from .budget import BudgetManager
@@ -50,6 +53,20 @@ class ChannelRunState:
     profile_note: str = ""
     mode: str = "agent"
     lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+@dataclass
+class AutoPilotState:
+    enabled: bool = False
+    interval_seconds: int = 900
+    objectives: list[str] = field(default_factory=list)
+    next_index: int = 0
+    last_run_at: str = ""
+    last_final: str = ""
+    last_log: str = ""
+    last_daily_summary_date: str = ""
+    last_daily_summary_path: str = ""
+    task: asyncio.Task[None] | None = None
 
 
 class RunRegistry:
@@ -100,6 +117,42 @@ def _failure_profile_path(project_root: Path) -> Path:
     return project_root / ".agent_state" / "failure_patterns.json"
 
 
+def _autopilot_objectives_path(project_root: Path) -> Path:
+    return project_root / ".agent_state" / "autopilot_objectives.txt"
+
+
+def _autopilot_history_path(project_root: Path) -> Path:
+    return project_root / ".agent_state" / "autopilot_history.jsonl"
+
+
+def _conversation_memory_path(project_root: Path) -> Path:
+    return project_root / ".agent_state" / "conversation_memory.json"
+
+
+def _load_conversation_memory(project_root: Path) -> dict[str, dict[str, object]]:
+    path = _conversation_memory_path(project_root)
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    out: dict[str, dict[str, object]] = {}
+    for key, value in payload.items():
+        if isinstance(key, str) and isinstance(value, dict):
+            out[key] = value
+    return out
+
+
+def _save_conversation_memory(project_root: Path, data: dict[str, dict[str, object]]) -> Path:
+    path = _conversation_memory_path(project_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
 def _build_external_adapters(enable: bool) -> dict[str, ExternalAgentAdapter]:
     if not enable:
         return {}
@@ -120,6 +173,60 @@ def _load_allowed_channel_ids() -> set[int]:
     return ids
 
 
+def _default_autopilot_objectives() -> list[str]:
+    return [
+        "あなた専用タスク: 直近作業から次の小さな一手を3件に絞り、`runs/auto_todo.md` を更新して finish する。",
+        "あなた専用タスク: 直近runログを見て失敗/停滞の傾向を1分で読める形で `runs/auto_health.md` に更新して finish する。",
+    ]
+
+
+def _load_autopilot_objectives(project_root: Path) -> list[str]:
+    profile_file = _autopilot_objectives_path(project_root)
+    if profile_file.exists():
+        rows = [line.strip() for line in profile_file.read_text(encoding="utf-8").splitlines()]
+        saved = [line for line in rows if line and not line.startswith("#")]
+        if saved:
+            return saved
+    raw = os.getenv("DISCORD_AUTOPILOT_OBJECTIVES", "").strip()
+    if not raw:
+        return _default_autopilot_objectives()
+    parts = [item.strip() for item in raw.split("||")]
+    values = [item for item in parts if item]
+    return values or _default_autopilot_objectives()
+
+
+def _save_autopilot_objectives(project_root: Path, objectives: list[str]) -> Path:
+    path = _autopilot_objectives_path(project_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = "\n".join(objectives) + "\n"
+    path.write_text(payload, encoding="utf-8")
+    return path
+
+
+def _append_autopilot_history(project_root: Path, record: dict) -> Path:
+    path = _autopilot_history_path(project_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return path
+
+
+def _tail_autopilot_history(project_root: Path, limit: int = 20) -> list[dict]:
+    path = _autopilot_history_path(project_root)
+    if not path.exists():
+        return []
+    rows = path.read_text(encoding="utf-8").splitlines()
+    out: list[dict] = []
+    for raw in rows[-max(1, limit) :]:
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            out.append(data)
+    return out
+
+
 def _env_bool(key: str, default: bool) -> bool:
     value = os.getenv(key)
     if value is None:
@@ -135,6 +242,112 @@ def _env_int(key: str, default: int) -> int:
         return int(value)
     except ValueError:
         return default
+
+
+def _transcribe_audio_file(path: Path) -> str:
+    model = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe").strip() or "gpt-4o-mini-transcribe"
+    client = OpenAI()
+    with path.open("rb") as f:
+        text = client.audio.transcriptions.create(model=model, file=f, response_format="text")
+    return str(text).strip()
+
+
+def _build_day_plan(objective: str) -> str:
+    text = objective.strip()
+    if not text:
+        text = "今日の重要タスクを整理する"
+    raw_items = re.split(r"[。\n,、]+", text)
+    seeds = [item.strip() for item in raw_items if item.strip()]
+    if not seeds:
+        seeds = [text]
+    tasks = seeds[:5]
+    now = datetime.now(UTC)
+    lines = [
+        "# Day Plan",
+        "",
+        f"- created_at: {now.isoformat()}",
+        f"- objective: {text}",
+        "",
+        "## Priorities",
+    ]
+    lines.extend([f"- {item}" for item in tasks] or ["- (none)"])
+    lines.extend(
+        [
+            "",
+            "## Time Blocks",
+            "- Morning: 最重要タスク1件を完了",
+            "- Afternoon: 実装/事務処理の進捗を2件進める",
+            "- Evening: 残タスク整理と翌日の準備",
+            "",
+            "## Morning Routine (Fixed)",
+            "- [ ] `!status` / `!auto_status` を確認",
+            "- [ ] 今日の最重要1件を `!plan_day ...` で明確化",
+            "- [ ] 25分だけ実行して成果を1行メモ",
+            "",
+            "## Night Routine (Fixed)",
+            "- [ ] 今日の結果を `runs/summary.md` に反映",
+            "- [ ] 未完了を3件以内に圧縮",
+            "- [ ] 明日の最初の1手を1行で決める",
+            "",
+            "## Checklist",
+            "- [ ] 最重要タスクを完了",
+            "- [ ] 進捗を `runs/summary.md` に反映",
+            "- [ ] 明日の最初の1手を決める",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _coach_next_step(mode: str, final: str, objective: str) -> str:
+    lowered = final.lower()
+    if "needs_review" in lowered or "review_status=not_ok" in lowered:
+        return "次の1手: `!review` の結果を解消してから `!deliver` を再実行。"
+    if "deliver=success" in lowered:
+        return "次の1手: `!approve feat: ...` で確定し、`!auto_status` で常駐状態を確認。"
+    if "error" in lowered or "stopped:" in lowered:
+        return "次の1手: `runs/manual_checklist.md` を確認し、最小修正後に再実行。"
+    if mode == "autopilot":
+        return "次の1手: `!auto_status` で直近履歴を確認し、必要なら `!auto_set` で目標を更新。"
+    if mode == "supervise":
+        return "次の1手: `runs/summary.md` を確認し、未解決事項だけを新しい `!deliver` に渡す。"
+    if mode == "agent":
+        return "次の1手: 完了内容を確認して、次の具体タスクを1つだけ指示する。"
+    return "次の1手: 結果を確認して、次に進める最小タスクを1件実行する。"
+
+
+def _routine_template(period: str) -> str:
+    now = datetime.now(UTC).isoformat()
+    if period == "morning":
+        lines = [
+            "# Routine: Morning",
+            "",
+            f"- created_at: {now}",
+            "",
+            "## Checks",
+            "- [ ] `!status` と `!auto_status` を確認",
+            "- [ ] 今日の最重要タスクを1件決める",
+            "- [ ] `!plan_day <目的>` を実行して日次計画を更新",
+            "",
+            "## Execute",
+            "- [ ] 25分集中して1タスクを進める",
+            "- [ ] 結果を1行メモして次の1手を決める",
+        ]
+    else:
+        lines = [
+            "# Routine: Night",
+            "",
+            f"- created_at: {now}",
+            "",
+            "## Review",
+            "- [ ] 今日の完了/未完了を確認",
+            "- [ ] `runs/summary.md` を更新",
+            "- [ ] `runs/auto_todo.md` を3件以内に整理",
+            "",
+            "## Prepare",
+            "- [ ] 明日の最初の1手を1行で記録",
+            "- [ ] 必要なら `!auto_set ...` で目標を更新",
+        ]
+    return "\n".join(lines)
 
 
 def _load_profile_overrides(project_root: Path) -> RouterProfile | None:
@@ -172,19 +385,30 @@ def _has_git_identity(workdir: Path) -> bool:
 
 
 def _collect_changed_files(workdir: Path) -> list[str]:
-    code, out = _run_cmd("git status --porcelain", workdir)
-    if code != 0:
-        return []
+    # Use name-only lists instead of parsing porcelain columns to avoid
+    # edge cases caused by local git status formatting.
+    commands = [
+        "git diff --name-only",
+        "git diff --name-only --cached",
+        "git ls-files --others --exclude-standard",
+    ]
     files: list[str] = []
-    for raw in out.splitlines():
-        line = raw.rstrip()
-        if len(line) < 4:
+    for command in commands:
+        code, out = _run_cmd(command, workdir)
+        if code != 0 or not out or out == "(no output)":
             continue
-        path_part = line[3:]
-        if " -> " in path_part:
-            path_part = path_part.split(" -> ", 1)[1]
-        files.append(path_part.strip())
-    return files
+        for raw in out.splitlines():
+            path = raw.strip()
+            if not path:
+                continue
+            files.append(path)
+    # de-duplicate while preserving order
+    unique: list[str] = []
+    for path in files:
+        if path in unique:
+            continue
+        unique.append(path)
+    return unique
 
 
 def _runtime_noise_paths() -> tuple[str, ...]:
@@ -232,6 +456,40 @@ def _forbidden_extension_hits(paths: list[str]) -> list[str]:
     return hits
 
 
+def _autopilot_allowed_prefixes() -> list[str]:
+    raw = os.getenv("DISCORD_AUTOPILOT_ALLOWED_PREFIXES", "").strip()
+    if raw:
+        return [item.strip() for item in raw.split(",") if item.strip()]
+    return ["runs/"]
+
+
+def _evaluate_autopilot_guard(workdir: Path, project_root: Path) -> tuple[bool, Path]:
+    all_changed = _collect_changed_files(workdir)
+    max_changed = max(1, _env_int("DISCORD_AUTOPILOT_MAX_CHANGED_FILES", 20))
+    allowed_prefixes = _autopilot_allowed_prefixes()
+    filtered = [path for path in all_changed if not _is_runtime_noise(path)]
+    disallowed = [
+        path for path in filtered if not any(path.startswith(prefix) for prefix in allowed_prefixes)
+    ]
+    ok = len(disallowed) == 0 and len(filtered) <= max_changed
+    report_path = project_root / "runs" / "autopilot_guard_report.md"
+    lines = [
+        "# Autopilot Guard Report",
+        "",
+        f"- status: {'PASS' if ok else 'FAIL'}",
+        f"- changed_files_count: {len(filtered)} (limit={max_changed})",
+        f"- disallowed_count: {len(disallowed)}",
+        f"- allowed_prefixes: {', '.join(allowed_prefixes)}",
+        "",
+        "## Changed Files",
+    ]
+    lines.extend([f"- {path}" for path in filtered[:120]] or ["- (none)"])
+    lines.extend(["", "## Disallowed"])
+    lines.extend([f"- {path}" for path in disallowed[:120]] or ["- (none)"])
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+    return ok, report_path
+
+
 def _diff_line_counts(workdir: Path) -> tuple[int, int]:
     code, out = _run_cmd("git diff --numstat --", workdir)
     if code != 0 or not out:
@@ -248,6 +506,43 @@ def _diff_line_counts(workdir: Path) -> tuple[int, int]:
         if d.isdigit():
             removed += int(d)
     return added, removed
+
+
+def _worktree_fingerprint(workdir: Path) -> tuple[int, int, int]:
+    files = _effective_changed_files(workdir)
+    added, removed = _diff_line_counts(workdir)
+    return len(files), added, removed
+
+
+def _repair_attempt_limit(failure_type: str, default_limit: int) -> int:
+    key_map = {
+        "test_failure": "DISCORD_REPAIR_TEST_MAX_ATTEMPTS",
+        "syntax_failure": "DISCORD_REPAIR_SYNTAX_MAX_ATTEMPTS",
+        "permission_failure": "DISCORD_REPAIR_PERMISSION_MAX_ATTEMPTS",
+        "unknown_failure": "DISCORD_REPAIR_UNKNOWN_MAX_ATTEMPTS",
+    }
+    key = key_map.get(failure_type)
+    if key is None:
+        return max(1, default_limit)
+    return max(1, _env_int(key, default_limit))
+
+
+def _repair_stagnant_limit(failure_type: str) -> int:
+    key_map = {
+        "test_failure": "DISCORD_REPAIR_TEST_STAGNANT_LIMIT",
+        "syntax_failure": "DISCORD_REPAIR_SYNTAX_STAGNANT_LIMIT",
+        "permission_failure": "DISCORD_REPAIR_PERMISSION_STAGNANT_LIMIT",
+        "unknown_failure": "DISCORD_REPAIR_UNKNOWN_STAGNANT_LIMIT",
+    }
+    default_map = {
+        "test_failure": 2,
+        "syntax_failure": 1,
+        "permission_failure": 1,
+        "unknown_failure": 2,
+    }
+    key = key_map.get(failure_type, "DISCORD_REPAIR_UNKNOWN_STAGNANT_LIMIT")
+    default_value = default_map.get(failure_type, 2)
+    return max(1, _env_int(key, default_value))
 
 
 def _evaluate_dod(workdir: Path, validation_ok: bool, alerts: list[str]) -> tuple[bool, str]:
@@ -348,7 +643,14 @@ def _review_findings(workdir: Path, project_root: Path) -> str:
     removed_lines = sum(1 for line in diff_text.splitlines() if line.startswith("-") and not line.startswith("---"))
     if added_lines + removed_lines > 800:
         medium.append(f"Large diff size: +{added_lines}/-{removed_lines}.")
-    if "todo" in diff_text.lower() or "fixme" in diff_text.lower():
+    # Check only added lines and only explicit markers, not phrases like "Auto TODO".
+    added_only = [
+        line[1:]
+        for line in diff_text.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    ]
+    marker_pat = re.compile(r"^\s*(?:#|//|/\*|\*|-)?\s*(TODO|FIXME)\b", re.IGNORECASE)
+    if any(marker_pat.search(line) for line in added_only):
         high.append("Diff includes TODO/FIXME markers.")
     if dod_path.exists():
         dod = dod_path.read_text(encoding="utf-8")
@@ -526,6 +828,36 @@ def _is_placeholder_commit_message(message: str) -> bool:
     return lower in placeholders
 
 
+def _low_quality_commit_message_reason(message: str) -> str | None:
+    text = message.strip()
+    lower = text.lower()
+    if len(text) < 10:
+        return "短すぎます。変更内容が分かる文にしてください。"
+    if len(text) > 100:
+        return "長すぎます。100文字以内に要約してください。"
+    if ":" not in text:
+        return "`type: summary` 形式を推奨します（例: `feat: tighten ...`）。"
+    request_like_tokens = (
+        "してください",
+        "してほしい",
+        "お願いします",
+        "まとめて",
+        "リサーチ",
+        "検索して",
+        "調査して",
+        "実行して",
+    )
+    if any(token in text for token in request_like_tokens):
+        return "依頼文ではなく、実装結果を要約したコミット文にしてください。"
+    valid_prefixes = ("feat:", "fix:", "chore:", "docs:", "refactor:", "test:", "perf:", "ci:", "build:")
+    if not lower.startswith(valid_prefixes):
+        return "先頭に `feat:` などの種別を付けてください。"
+    summary = text.split(":", 1)[1].strip() if ":" in text else ""
+    if len(summary) < 6:
+        return "コロン以降の要約が短すぎます。"
+    return None
+
+
 def _write_pr_ready_bundle(project_root: Path, workdir: Path) -> Path:
     release_note_path = project_root / "runs" / "release_note.md"
     review_report_path = project_root / "runs" / "review_report.md"
@@ -578,6 +910,87 @@ def _is_git_repo(workdir: Path) -> bool:
 def _latest_logs(runs_dir: Path, limit: int = 5) -> list[Path]:
     files = sorted(runs_dir.glob("run-*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
     return files[: max(1, limit)]
+
+
+def _infer_failure_kind(text: str) -> str:
+    lowered = text.lower()
+    if any(token in lowered for token in ("permission denied", "authentication", "forbidden", "blocked")):
+        return "permission_failure"
+    if any(
+        token in lowered
+        for token in ("syntaxerror", "jsondecodeerror", "indentationerror", "typeerror", "traceback")
+    ):
+        return "syntax_failure"
+    if any(token in lowered for token in ("pytest", "failed", "assert", "no tests ran", "collected 0 items")):
+        return "test_failure"
+    return "unknown_failure"
+
+
+def _write_manual_checklist(
+    project_root: Path,
+    objective: str,
+    final_message: str,
+    run_log: str,
+) -> Path:
+    failure_kind = _infer_failure_kind(final_message)
+    path = project_root / "runs" / "manual_checklist.md"
+    lines = [
+        "# Manual Checklist",
+        "",
+        f"- generated_at: {datetime.now(UTC).isoformat()}",
+        f"- failure_kind: {failure_kind}",
+        f"- objective: {objective}",
+        f"- final: {final_message}",
+        f"- run_log: {run_log or '(none)'}",
+        "",
+        "## Actions",
+        "- 1) run `!status` and confirm current state",
+        "- 2) read `runs/validation_report.md` and identify the first failing command",
+        "- 3) run `!review` and check Critical/High findings",
+        "- 4) apply minimal fix and rerun `!deliver ...`",
+        "- 5) if auth/permission related, refresh credentials and retry",
+        "",
+        "## Notes",
+        "- このチェックリストは自動生成です。必要に応じて追記してください。",
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def _write_daily_summary(project_root: Path, auto: AutoPilotState) -> Path:
+    runs_dir = project_root / "runs"
+    summary_path = runs_dir / "daily_summary.md"
+    latest = _latest_logs(runs_dir, limit=5)
+    auto_todo = runs_dir / "auto_todo.md"
+    auto_health = runs_dir / "auto_health.md"
+    todo_text = auto_todo.read_text(encoding="utf-8")[:1200] if auto_todo.exists() else "(none)"
+    health_text = auto_health.read_text(encoding="utf-8")[:1200] if auto_health.exists() else "(none)"
+    lines = [
+        "# Daily Summary",
+        "",
+        f"- date: {datetime.now(UTC).date().isoformat()}",
+        f"- autopilot_last_run: {auto.last_run_at or '(none)'}",
+        f"- autopilot_last_final: {auto.last_final or '(none)'}",
+        "",
+        "## Latest Runs",
+    ]
+    lines.extend([f"- {item.name}" for item in latest] or ["- (none)"])
+    lines.extend(
+        [
+            "",
+            "## Auto TODO",
+            "```text",
+            todo_text,
+            "```",
+            "",
+            "## Auto Health",
+            "```text",
+            health_text,
+            "```",
+        ]
+    )
+    summary_path.write_text("\n".join(lines), encoding="utf-8")
+    return summary_path
 
 
 def _detect_project_type(workdir: Path) -> str:
@@ -656,6 +1069,376 @@ def _run_validation_suite(workdir: Path) -> tuple[bool, str]:
     return ok_all, "\n".join(lines)
 
 
+def _has_no_tests_signal_in_text(text: str) -> bool:
+    lowered = text.lower()
+    return "collected 0 items" in lowered or "no tests ran" in lowered
+
+
+def _detect_no_tests_in_runlog(run_log_path: str) -> bool:
+    path = Path(run_log_path)
+    if not path.exists():
+        return False
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(raw)
+        except Exception:
+            continue
+        if row.get("event") != "observation":
+            continue
+        output = str(row.get("output", ""))
+        if _has_no_tests_signal_in_text(output):
+            return True
+    return False
+
+
+def _runlog_directory_listing_count(run_log_path: str) -> int:
+    path = Path(run_log_path)
+    if not path.exists():
+        return 0
+    count = 0
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(raw)
+        except Exception:
+            continue
+        if row.get("event") != "observation":
+            continue
+        output = str(row.get("output", ""))
+        if "Path is a directory. Listing:" in output:
+            count += 1
+    return count
+
+
+def _runlog_quality_flags(run_log_path: str) -> list[str]:
+    path = Path(run_log_path)
+    if not path.exists():
+        return ["missing_run_log"]
+    invalid_tool_count = 0
+    directory_listing_count = 0
+    write_ok = 0
+    shell_ok = 0
+    finish_called = 0
+    decided_tools_by_step: dict[int, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(raw)
+        except Exception:
+            continue
+        event = str(row.get("event", ""))
+        if event == "decision":
+            step = int(row.get("step", -1))
+            tool = str(row.get("tool", "")).strip()
+            if step >= 0 and tool:
+                decided_tools_by_step[step] = tool
+            if tool == "finish":
+                finish_called += 1
+        if event == "observation":
+            step = int(row.get("step", -1))
+            output = str(row.get("output", ""))
+            tool = str(row.get("tool", "")).strip() or decided_tools_by_step.get(step, "")
+            ok = bool(row.get("ok"))
+            if "No-op: planner returned invalid tool" in output or "No-op: empty shell command" in output:
+                invalid_tool_count += 1
+            if "Path is a directory. Listing:" in output:
+                directory_listing_count += 1
+            if ok and tool == "write_file":
+                write_ok += 1
+            if ok and tool == "shell":
+                shell_ok += 1
+    flags: list[str] = []
+    if invalid_tool_count >= 3:
+        flags.append("invalid_tool_loop")
+    if directory_listing_count >= 3:
+        flags.append("directory_listing_loop")
+    if write_ok == 0 and shell_ok == 0:
+        flags.append("no_productive_action")
+    if finish_called == 0:
+        flags.append("no_finish_decision")
+    return flags
+
+
+def _fixed_repair_strategy(base_failure_type: str, attempt_index: int) -> str:
+    # attempt_index is 1-based
+    strategy_table = {
+        "test_failure": ["test_failure", "syntax_failure", "unknown_failure"],
+        "syntax_failure": ["syntax_failure", "test_failure", "unknown_failure"],
+        "permission_failure": ["permission_failure"],
+        "unknown_failure": ["syntax_failure", "test_failure", "unknown_failure"],
+    }
+    order = strategy_table.get(base_failure_type, strategy_table["unknown_failure"])
+    idx = min(max(1, attempt_index), len(order)) - 1
+    return order[idx]
+
+
+def _is_non_code_objective(text: str) -> bool:
+    value = text.strip().lower()
+    if not value:
+        return False
+    non_code_tokens = (
+        "リサーチ",
+        "調査",
+        "要約",
+        "まとめ",
+        "ニュース",
+        "議事録",
+        "資料",
+        "メール",
+        "文面",
+        "文章",
+    )
+    code_tokens = (
+        "実装",
+        "修正",
+        "テスト",
+        "pytest",
+        "compileall",
+        "バグ",
+        "エラー",
+        "git",
+        "diff",
+        "コミット",
+        "approve",
+    )
+    has_non_code = any(token in value for token in non_code_tokens)
+    has_code = any(token in value for token in code_tokens)
+    return has_non_code and not has_code
+
+
+def _write_non_code_summary(workdir: Path, objective: str) -> Path:
+    def pick_source() -> tuple[str, str]:
+        candidates = [
+            ("research_data.txt", workdir / "research_data.txt"),
+            ("runs/day_plan.md", workdir / "runs" / "day_plan.md"),
+            ("runs/summary.md", workdir / "runs" / "summary.md"),
+        ]
+        for name, path in candidates:
+            if not path.exists():
+                continue
+            text = path.read_text(encoding="utf-8").strip()
+            if text:
+                return name, text[:3000]
+        return "(none)", ""
+
+    def extract_urls(text: str) -> list[str]:
+        urls = re.findall(r"https?://[^\s)>\"]+", text)
+        uniq: list[str] = []
+        for url in urls:
+            if url not in uniq:
+                uniq.append(url)
+        return uniq[:5]
+
+    def extract_dates(text: str) -> list[str]:
+        patterns = [
+            r"\b\d{4}-\d{2}-\d{2}\b",
+            r"\b\d{4}/\d{2}/\d{2}\b",
+            r"\b\d{4}\.\d{2}\.\d{2}\b",
+        ]
+        found: list[str] = []
+        for pat in patterns:
+            for item in re.findall(pat, text):
+                if item not in found:
+                    found.append(item)
+        return found[:5]
+
+    def to_fact_points(text: str) -> list[str]:
+        speculative = ("かもしれ", "推測", "予想", "見込み", "と思われ", "可能性", "inference")
+        parts = [p.strip(" -\t") for p in re.split(r"[。\n]+", text) if p.strip()]
+        facts: list[str] = []
+        for part in parts:
+            lower = part.lower()
+            if len(part) < 4:
+                continue
+            if any(token in part for token in speculative) or any(token in lower for token in speculative):
+                continue
+            facts.append(part[:140])
+            if len(facts) >= 3:
+                break
+        while len(facts) < 3:
+            facts.append("事実情報の候補が不足しています（出典付きデータを追加してください）。")
+        return facts[:3]
+
+    summary_path = workdir / "summary.txt"
+    src, source_text = pick_source()
+    points = to_fact_points(source_text)
+    urls = extract_urls(source_text)
+    dates = extract_dates(source_text)
+    reliability = {
+        "research_data.txt": "high",
+        "runs/day_plan.md": "medium",
+        "runs/summary.md": "low",
+        "(none)": "low",
+    }.get(src, "low")
+    generated_at = datetime.now(UTC).isoformat()
+    unresolved = (
+        "一次ソース確認が未完了。必要なら原文・URL・日付を追記してください。"
+        if src != "(none)"
+        else "入力データ不足（research_data.txt / runs/day_plan.md / runs/summary.md が空または未作成）。"
+    )
+    next_action = (
+        "不足情報を1件だけ補って、再度 `リサーチ内容をまとめて` を実行。"
+        if src == "(none)"
+        else "要点3つのうち最優先1件を実行タスク化して進める。"
+    )
+    citation_lines: list[str] = []
+    if urls:
+        for url in urls:
+            citation_lines.append(f"- url: {url} | date: {(dates[0] if dates else 'unknown')} | reliability: {reliability}")
+    else:
+        citation_lines.append(f"- url: unknown | date: {(dates[0] if dates else 'unknown')} | reliability: low")
+    content = (
+        "# Non-Code Summary\n\n"
+        f"Generated At: {generated_at}\n"
+        f"Objective: {objective}\n"
+        f"Source: {src}\n\n"
+        f"Reliability: {reliability}\n\n"
+        "## Citations (Required)\n"
+        + "\n".join(citation_lines)
+        + "\n\n"
+        "## Facts\n"
+        f"- [fact] {points[0]}\n"
+        f"- [fact] {points[1]}\n"
+        f"- [fact] {points[2]}\n\n"
+        "## Inferences\n"
+        f"- [inference] {next_action}\n\n"
+        "## Key Points\n"
+        f"- {points[0]}\n"
+        f"- {points[1]}\n"
+        f"- {points[2]}\n\n"
+        "## Unresolved\n"
+        f"- {unresolved}\n\n"
+        "## Next Action\n"
+        f"- {next_action}\n"
+    )
+    summary_path.write_text(content, encoding="utf-8")
+    return summary_path
+
+
+def _classify_validation_failure(report_text: str) -> str:
+    sections: list[tuple[str, int | None, str]] = []
+    current_command = ""
+    current_exit_code: int | None = None
+    body_lines: list[str] = []
+
+    for raw in report_text.splitlines():
+        line = raw.rstrip("\n")
+        if line.startswith("## Command:"):
+            if current_command:
+                sections.append((current_command, current_exit_code, "\n".join(body_lines)))
+            current_command = line.replace("## Command:", "", 1).strip().strip("`")
+            current_exit_code = None
+            body_lines = []
+            continue
+        if line.startswith("- exit_code:"):
+            value = line.split(":", 1)[1].strip()
+            try:
+                current_exit_code = int(value)
+            except ValueError:
+                current_exit_code = None
+            continue
+        body_lines.append(line)
+
+    if current_command:
+        sections.append((current_command, current_exit_code, "\n".join(body_lines)))
+
+    failing_sections = [
+        (cmd, code, body)
+        for cmd, code, body in sections
+        if (code is not None and code != 0) or "policy_violation" in body.lower()
+    ]
+
+    permission_tokens = (
+        "permission denied",
+        "operation not permitted",
+        "access denied",
+        "authentication failed",
+        "could not read from remote repository",
+        "403",
+        "forbidden",
+        "blocked by strict shell allowlist",
+    )
+    syntax_tokens = (
+        "syntaxerror",
+        "jsondecodeerror",
+        "indentationerror",
+        "nameerror",
+        "typeerror",
+    )
+
+    for command, _, body in failing_sections:
+        text = f"{command}\n{body}".lower()
+        if any(token in text for token in permission_tokens):
+            return "permission_failure"
+
+    for command, _, body in failing_sections:
+        text = f"{command}\n{body}".lower()
+        if "pytest" in command.lower() or "no tests ran" in text or "collected 0 items" in text:
+            return "test_failure"
+
+    for command, _, body in failing_sections:
+        text = f"{command}\n{body}".lower()
+        if "compileall" in command.lower() or any(token in text for token in syntax_tokens):
+            return "syntax_failure"
+
+    if failing_sections:
+        return "unknown_failure"
+
+    text = report_text.lower()
+    if any(token in text for token in permission_tokens):
+        return "permission_failure"
+    if "pytest" in text:
+        return "test_failure"
+    if "compileall" in text or any(token in text for token in syntax_tokens):
+        return "syntax_failure"
+    return "unknown_failure"
+
+
+def _build_repair_objective(base_objective: str, failure_type: str) -> str:
+    if failure_type == "test_failure":
+        strategy = (
+            "修復戦略: テスト失敗を最優先。"
+            " failing test/exit_code を特定し、最小変更で修正し、pytestを再実行して結果を確認する。"
+            " テストが0件の場合は有効なテスト対象を指定して再実行する。"
+        )
+    elif failure_type == "syntax_failure":
+        strategy = (
+            "修復戦略: 構文/実行時エラーを最優先。"
+            " tracebackやcompileall出力の先頭エラーから順に修正し、compileall -> pytest の順で再検証する。"
+        )
+    elif failure_type == "permission_failure":
+        strategy = (
+            "修復戦略: 権限/認証エラー。"
+            " コード変更で解決できない場合が多いため、原因を明示して安全に停止し、"
+            " 必要な手動操作（認証/権限設定）を summary に残す。"
+        )
+    else:
+        strategy = (
+            "修復戦略: 汎用。"
+            " validation_report の先頭失敗コマンドを起点に原因を切り分け、"
+            " 最小変更で修正後に再検証する。"
+        )
+    return (
+        "以下の検証レポートに基づいて失敗を修正してください。"
+        f"\nreport_path=runs/validation_report.md\nfailure_type={failure_type}\n"
+        f"{strategy}\n\n{base_objective}"
+    )
+
+
+def _build_repair_objective_with_stagnation_note(
+    base_objective: str,
+    failure_type: str,
+    stagnant_repair_count: int,
+) -> str:
+    objective = _build_repair_objective(base_objective, failure_type)
+    if stagnant_repair_count <= 0:
+        return objective
+    return (
+        objective
+        + "\n追加制約: 前回までの修復で有効な差分がほぼ増えていません。"
+        " 今回は必ず `write_file` を使って最小限の修正を行い、"
+        " その後に1回だけpytest/compileallで再検証してfinishしてください。"
+    )
+
+
 def _extract_validation_alert_lines(report_text: str) -> list[str]:
     alerts: list[str] = []
     keywords = (
@@ -685,6 +1468,74 @@ def _extract_validation_alert_lines(report_text: str) -> list[str]:
         if len(unique) >= 12:
             break
     return unique
+
+
+def _extract_validation_brief(report_text: str) -> list[str]:
+    brief: list[str] = []
+    for raw in report_text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        lower = line.lower()
+        if line.startswith("## Command:"):
+            brief.append(line)
+        elif line.startswith("- exit_code:"):
+            brief.append(line)
+        elif " passed in " in lower or " failed in " in lower:
+            brief.append(line)
+        if len(brief) >= 12:
+            break
+    return brief
+
+
+def _write_summary_template(
+    *,
+    workdir: Path,
+    project_root: Path,
+    objective: str,
+    impl_final: str,
+    validation_ok: bool,
+    validation_report: str,
+    alerts: list[str],
+) -> str:
+    summary_path = project_root / "runs" / "summary.md"
+    changed_files = _effective_changed_files(workdir)
+    validation_brief = _extract_validation_brief(validation_report)
+    lines = [
+        "## Objective",
+        objective,
+        "",
+        "## Changes",
+    ]
+    lines.extend([f"- {path}" for path in changed_files[:80]] or ["- (none)"])
+    lines.extend(
+        [
+            "",
+            "## Validation",
+            f"- status: {'ok' if validation_ok else 'failed'}",
+            f"- implementer: {impl_final}",
+        ]
+    )
+    lines.extend([f"- {line}" for line in validation_brief] or ["- (no validation details)"])
+    lines.extend(
+        [
+            "",
+            "## Validation Alerts",
+        ]
+    )
+    lines.extend([f"- {line}" for line in alerts] or ["- (none)"])
+    lines.extend(
+        [
+            "",
+            "## Unresolved",
+            "- (none)",
+            "",
+            "## Next Steps",
+            "- Run `!review` and confirm `status=OK` before `!approve`.",
+        ]
+    )
+    summary_path.write_text("\n".join(lines), encoding="utf-8")
+    return str(summary_path)
 
 
 def _ensure_branch(workdir: Path) -> str:
@@ -753,6 +1604,9 @@ def _run_agent_job(
     strict_shell_allowlist = False
     extra_safe_shell_prefixes: tuple[str, ...] | None = None
     shell_allow_prefixes: tuple[str, ...] | None = None
+    write_allow_prefixes: tuple[str, ...] | None = None
+    write_allow_extensions: tuple[str, ...] | None = None
+    write_allow_paths: tuple[str, ...] | None = None
     if worker_name == "tester":
         project_type = _detect_project_type(workdir)
         if project_type == "python":
@@ -785,6 +1639,15 @@ def _run_agent_job(
             + " shellは pytest/compileall 系コマンドのみ許可。"
             + " 同じ成功結果を繰り返さず、完了したら即 finish。"
         )
+    if worker_name == "autopilot":
+        write_allow_prefixes = ("runs/",)
+        write_allow_extensions = (".md",)
+        write_allow_paths = ("runs/auto_todo.md", "runs/auto_health.md")
+        objective = (
+            objective
+            + "\n制約: autopilot の書き込み先は `runs/auto_todo.md` と `runs/auto_health.md` のみ。"
+            + " それ以外のパスへは write_file/append_file を使わないこと。"
+        )
 
     tools = ToolRunner(
         workdir=config.workdir,
@@ -795,6 +1658,9 @@ def _run_agent_job(
         strict_shell_allowlist=strict_shell_allowlist,
         extra_safe_shell_prefixes=extra_safe_shell_prefixes,
         shell_allow_prefixes=shell_allow_prefixes,
+        write_allow_prefixes=write_allow_prefixes,
+        write_allow_extensions=write_allow_extensions,
+        write_allow_paths=write_allow_paths,
     )
     runs_dir = project_root / "runs"
     memory = JsonlMemory(output_dir=runs_dir)
@@ -877,15 +1743,252 @@ def main() -> int:
 
     allowed_channels = _load_allowed_channel_ids()
     registry = RunRegistry()
+    autopilot_states: dict[int, AutoPilotState] = {}
+    coach_states: dict[int, bool] = {}
+    pending_approve_messages: dict[int, str] = {}
+    conversation_memory = _load_conversation_memory(project_root)
+    conversation_memory_lock = threading.Lock()
     intents = discord.Intents.default()
     intents.message_content = True
     bot = commands.Bot(command_prefix="!", intents=intents)
+
+    def is_coach_enabled(channel_id: int) -> bool:
+        if channel_id not in coach_states:
+            coach_states[channel_id] = _env_bool("DISCORD_COACH_MODE_DEFAULT", True)
+        return coach_states[channel_id]
+
+    def get_channel_memory(channel_id: int) -> dict[str, object]:
+        key = str(channel_id)
+        with conversation_memory_lock:
+            row = conversation_memory.get(key)
+            if row is None:
+                row = {
+                    "last_objective": "",
+                    "last_mode": "",
+                    "last_final": "",
+                    "last_run_at": "",
+                    "last_success_objective": "",
+                    "last_success_mode": "",
+                    "recent_objectives": [],
+                }
+                conversation_memory[key] = row
+            return dict(row)
+
+    def update_channel_memory(
+        channel_id: int,
+        *,
+        mode: str,
+        objective: str,
+        final: str,
+        run_log: str,
+    ) -> Path:
+        key = str(channel_id)
+        with conversation_memory_lock:
+            row = conversation_memory.get(key, {})
+            recent = row.get("recent_objectives", [])
+            if not isinstance(recent, list):
+                recent = []
+            if objective.strip():
+                recent.append(objective.strip())
+            recent = [str(item)[:500] for item in recent][-20:]
+            new_row: dict[str, object] = {
+                "last_objective": objective.strip()[:1000],
+                "last_mode": mode,
+                "last_final": final[:1000],
+                "last_run_at": datetime.now(UTC).isoformat(),
+                "last_run_log": run_log,
+                "recent_objectives": recent,
+                "last_success_objective": str(row.get("last_success_objective", "")),
+                "last_success_mode": str(row.get("last_success_mode", "")),
+            }
+            if final.lower().startswith("finished:") or "deliver=success" in final.lower():
+                new_row["last_success_objective"] = objective.strip()[:1000]
+                new_row["last_success_mode"] = mode
+            conversation_memory[key] = new_row
+            return _save_conversation_memory(project_root, conversation_memory)
+
+    async def send_with_coach(
+        ctx: commands.Context,
+        *,
+        mode: str,
+        objective: str,
+        final: str,
+        run_log: str,
+        note: str,
+        prefix: str = "完了",
+    ) -> None:
+        message = f"{prefix}\nfinal={final}\nlog={run_log}\n{note}"
+        if is_coach_enabled(ctx.channel.id):
+            message += "\n" + _coach_next_step(mode, final, objective)
+        await ctx.send(message[:1800])
+
+    def get_autopilot_state(channel_id: int) -> AutoPilotState:
+        if channel_id not in autopilot_states:
+            autopilot_states[channel_id] = AutoPilotState(
+                enabled=False,
+                interval_seconds=max(60, _env_int("DISCORD_AUTOPILOT_INTERVAL_SECONDS", 900)),
+                objectives=_load_autopilot_objectives(project_root),
+            )
+        return autopilot_states[channel_id]
+
+    async def _run_autopilot_once(channel_id: int, trigger: str = "timer") -> tuple[bool, str]:
+        if not is_allowed_channel(channel_id):
+            return False, "blocked channel"
+        state = registry.get(channel_id)
+        auto = get_autopilot_state(channel_id)
+        if not auto.objectives:
+            return False, "no objectives configured"
+        with state.lock:
+            if state.running:
+                return False, "already running"
+            objective = auto.objectives[auto.next_index % len(auto.objectives)]
+            auto.next_index = (auto.next_index + 1) % len(auto.objectives)
+            state.running = True
+            state.mode = "autopilot"
+            state.cancelled = False
+            state.objective = objective
+            state.step = 0
+            state.last_event = "queued"
+            state.final_message = ""
+            state.output_tail = ""
+            state.profile_note = ""
+
+        channel = bot.get_channel(channel_id)
+        started_at = datetime.now(UTC)
+        if isinstance(channel, discord.abc.Messageable):
+            try:
+                await channel.send(
+                    f"autopilot開始 trigger={trigger}\nobjective={objective}"
+                )
+            except Exception:
+                pass
+
+        def progress_hook(_: str) -> None:
+            return
+
+        try:
+            final, run_log, note = await asyncio.to_thread(
+                _run_agent_job,
+                project_root=project_root,
+                workdir=workdir,
+                objective=objective,
+                state=state,
+                progress_hook=progress_hook,
+                worker_name="autopilot",
+                max_steps_override=max(3, _env_int("DISCORD_AUTOPILOT_MAX_STEPS", 8)),
+                forced_allowed_tools=["read_file", "write_file", "finish"],
+                noop_streak_limit=2,
+            )
+            release_state(state, final, run_log, note)
+            update_channel_memory(
+                channel_id,
+                mode="autopilot",
+                objective=objective,
+                final=final,
+                run_log=run_log,
+            )
+            auto.last_run_at = datetime.now(UTC).isoformat()
+            auto.last_final = final
+            auto.last_log = run_log
+            guard_ok, guard_report_path = _evaluate_autopilot_guard(workdir, project_root)
+            if not guard_ok:
+                final = "Stopped: autopilot guard violation detected."
+                auto.last_final = final
+                if isinstance(channel, discord.abc.Messageable):
+                    try:
+                        await channel.send(f"autopilotガード違反: {guard_report_path}")
+                    except Exception:
+                        pass
+            final_lower = final.lower()
+            if any(token in final_lower for token in ("stopped:", "needs_review", "error", "failed")):
+                checklist_path = _write_manual_checklist(project_root, objective, final, run_log)
+                if isinstance(channel, discord.abc.Messageable):
+                    try:
+                        await channel.send(f"autopilot失敗チェックリストを生成しました: {checklist_path}")
+                    except Exception:
+                        pass
+            if isinstance(channel, discord.abc.Messageable):
+                try:
+                    await channel.send(
+                        f"autopilot完了\nfinal={final}\nlog={run_log}\n{note}"
+                    )
+                except Exception:
+                    pass
+            history_path = _append_autopilot_history(
+                project_root,
+                {
+                    "ts": datetime.now(UTC).isoformat(),
+                    "channel_id": channel_id,
+                    "trigger": trigger,
+                    "objective": objective,
+                    "final": final,
+                    "run_log": run_log,
+                    "duration_seconds": int((datetime.now(UTC) - started_at).total_seconds()),
+                    "success": final.lower().startswith("finished:") and guard_ok,
+                    "guard_ok": guard_ok,
+                    "guard_report": str(guard_report_path),
+                },
+            )
+            if isinstance(channel, discord.abc.Messageable):
+                try:
+                    await channel.send(f"autopilot履歴を更新: {history_path}")
+                except Exception:
+                    pass
+            return True, final
+        except Exception as exc:
+            err = f"error: {type(exc).__name__}: {exc}"
+            release_state(state, err)
+            auto.last_run_at = datetime.now(UTC).isoformat()
+            auto.last_final = err
+            history_path = _append_autopilot_history(
+                project_root,
+                {
+                    "ts": datetime.now(UTC).isoformat(),
+                    "channel_id": channel_id,
+                    "trigger": trigger,
+                    "objective": objective,
+                    "final": err,
+                    "run_log": "",
+                    "duration_seconds": int((datetime.now(UTC) - started_at).total_seconds()),
+                    "success": False,
+                    "guard_ok": False,
+                    "guard_report": "",
+                },
+            )
+            if isinstance(channel, discord.abc.Messageable):
+                try:
+                    await channel.send(f"autopilotエラー: {err}\nhistory={history_path}")
+                except Exception:
+                    pass
+            return False, err
+
+    async def _maybe_post_daily_summary(channel_id: int, force: bool = False) -> None:
+        auto = get_autopilot_state(channel_id)
+        today = datetime.now(UTC).date().isoformat()
+        if not force and auto.last_daily_summary_date == today:
+            return
+        summary_path = _write_daily_summary(project_root, auto)
+        auto.last_daily_summary_date = today
+        auto.last_daily_summary_path = str(summary_path)
+        channel = bot.get_channel(channel_id)
+        if isinstance(channel, discord.abc.Messageable):
+            try:
+                await channel.send(f"daily_summary更新: {summary_path}")
+            except Exception:
+                pass
+
+    async def _autopilot_loop(channel_id: int) -> None:
+        auto = get_autopilot_state(channel_id)
+        while auto.enabled:
+            await _run_autopilot_once(channel_id, trigger="timer")
+            await _maybe_post_daily_summary(channel_id)
+            await asyncio.sleep(max(30, auto.interval_seconds))
 
     @bot.event
     async def on_ready() -> None:
         print(f"Discord bot logged in as {bot.user}", flush=True)
         print(
-            "Commands: !agent !supervise !deliver !autopr !review !status !cancel !runs !tail !diff !approve !rollback",
+            "Commands: !agent !supervise !deliver !summarize !autopr !review !status !memory_status !memory_clear !cancel !runs !tail !diff !approve !rollback !auto_on !auto_off !auto_status !auto_now !auto_set !auto_daily !voice !plan_day !routine_morning !routine_night !coach_on !coach_off !coach_status",
             flush=True,
         )
 
@@ -902,6 +2005,222 @@ def main() -> int:
 
     def is_allowed_channel(channel_id: int) -> bool:
         return not allowed_channels or channel_id in allowed_channels
+
+    def _extract_after_keyword(text: str, keywords: list[str]) -> str:
+        lowered = text.lower()
+        for key in keywords:
+            idx = lowered.find(key.lower())
+            if idx >= 0:
+                return text[idx + len(key):].strip(" ：:　")
+        return ""
+
+    def _is_generic_objective_text(text: str) -> bool:
+        value = text.strip()
+        if len(value) < 12:
+            return True
+        generic_phrases = (
+            "内容をまとめて",
+            "まとめて",
+            "要約して",
+            "調査して",
+            "リサーチして",
+            "これを",
+            "これ",
+        )
+        return any(phrase in value for phrase in generic_phrases)
+
+    def _is_yes_message(text: str) -> bool:
+        lowered = text.strip().lower()
+        return lowered in {"はい", "ok", "おけ", "実行", "進めて", "yes", "y"}
+
+    def _is_no_message(text: str) -> bool:
+        lowered = text.strip().lower()
+        return lowered in {"いいえ", "やめる", "キャンセル", "no", "n", "stop"}
+
+    def _is_continuation_message(text: str) -> bool:
+        tokens = ("続き", "続けて", "同じ感じ", "これお願い", "それお願い", "進めて", "このまま")
+        return any(token in text for token in tokens)
+
+    async def _dispatch_natural_language(ctx: commands.Context) -> bool:
+        if not _env_bool("DISCORD_NL_ENABLED", True):
+            return False
+        if ctx.guild is not None and not is_allowed_channel(ctx.channel.id):
+            return False
+        text = (ctx.message.content or "").strip()
+        if not text or text.startswith("!"):
+            return False
+        lowered = text.lower()
+
+        if _env_bool("DISCORD_APPROVE_CONFIRM_NL", True):
+            pending = pending_approve_messages.get(ctx.channel.id, "")
+            if pending:
+                if _is_yes_message(text):
+                    pending_approve_messages.pop(ctx.channel.id, None)
+                    cmd = bot.get_command("approve")
+                    if cmd is None:
+                        await ctx.reply("approve コマンドが見つかりませんでした。")
+                        return True
+                    await ctx.reply(f"確認OK: `!approve {pending}` を実行します。")
+                    await ctx.invoke(cmd, message=pending)
+                    return True
+                if _is_no_message(text):
+                    pending_approve_messages.pop(ctx.channel.id, None)
+                    await ctx.reply("approve をキャンセルしました。")
+                    return True
+
+        async def invoke_simple(name: str) -> bool:
+            cmd = bot.get_command(name)
+            if cmd is None:
+                return False
+            await ctx.reply(f"自然文解釈: `!{name}` を実行します。")
+            await ctx.invoke(cmd)
+            return True
+
+        async def invoke_objective(name: str, objective: str) -> bool:
+            cmd = bot.get_command(name)
+            if cmd is None:
+                return False
+            obj = objective.strip()
+            if not obj:
+                await ctx.reply(f"自然文解釈で `!{name}` を選びましたが、目的文が空でした。")
+                return True
+            await ctx.reply(f"自然文解釈: `!{name}` を実行します。\nobjective={obj[:300]}")
+            await ctx.invoke(cmd, objective=obj)
+            return True
+
+        async def invoke_approve(message: str) -> bool:
+            cmd = bot.get_command("approve")
+            if cmd is None:
+                return False
+            msg = message.strip()
+            if not msg:
+                await ctx.reply("自然文解釈: approve候補ですが、コミットメッセージが不足しています。")
+                return True
+            if _env_bool("DISCORD_APPROVE_CONFIRM_NL", True):
+                pending_approve_messages[ctx.channel.id] = msg
+                await ctx.reply(
+                    "自然文解釈: approve候補です。実行確認します。\n"
+                    f"候補: `!approve {msg}`\n"
+                    "この内容でコミットしますか？（はい / いいえ）"
+                )
+                return True
+            await ctx.reply(f"自然文解釈: `!approve {msg}` を実行します。")
+            await ctx.invoke(cmd, message=msg)
+            return True
+
+        if any(token in lowered for token in ("!review", "review", "レビュー", "査読")):
+            return await invoke_simple("review")
+        if "routine_morning" in lowered or ("朝" in text and "ルーティン" in text):
+            return await invoke_simple("routine_morning")
+        if "routine_night" in lowered or ("夜" in text and "ルーティン" in text):
+            return await invoke_simple("routine_night")
+        if "coach_on" in lowered or ("コーチ" in text and "オン" in text):
+            return await invoke_simple("coach_on")
+        if "coach_off" in lowered or ("コーチ" in text and "オフ" in text):
+            return await invoke_simple("coach_off")
+        if "coach_status" in lowered or ("コーチ" in text and "状態" in text):
+            return await invoke_simple("coach_status")
+        if "auto_status" in lowered or ("autopilot" in lowered and "status" in lowered) or ("自動実行" in text and "状態" in text):
+            return await invoke_simple("auto_status")
+        if "auto_now" in lowered or ("自動実行" in text and ("今" in text or "すぐ" in text)):
+            return await invoke_simple("auto_now")
+        if "auto_off" in lowered or ("autopilot" in lowered and "off" in lowered) or ("自動実行" in text and "停止" in text):
+            return await invoke_simple("auto_off")
+        if "auto_on" in lowered or ("autopilot" in lowered and "on" in lowered) or ("自動実行" in text and ("開始" in text or "有効" in text)):
+            return await invoke_simple("auto_on")
+        if "auto_daily" in lowered or ("日次" in text and "サマリ" in text):
+            return await invoke_simple("auto_daily")
+        if any(token in lowered for token in ("status", "進捗", "状況")):
+            return await invoke_simple("status")
+
+        if "approve" in lowered or "承認" in text or "コミットして" in text:
+            message = _extract_after_keyword(
+                text,
+                ["!approve", "approve", "承認", "コミットして", "コミット"],
+            )
+            return await invoke_approve(message)
+
+        if "plan_day" in lowered or ("計画" in text and ("今日" in text or "1日" in text)):
+            objective = _extract_after_keyword(text, ["!plan_day", "plan_day", "計画", "プラン"])
+            if not objective:
+                objective = text
+            return await invoke_objective("plan_day", objective)
+
+        if (
+            "deliver" in lowered
+            or "実装" in text
+            or "修正" in text
+            or "検証" in text
+            or "リサーチ" in text
+            or "調査" in text
+            or "まとめて" in text
+            or "要約" in text
+        ):
+            objective = _extract_after_keyword(
+                text,
+                ["!deliver", "deliver", "実装", "修正", "検証", "リサーチ", "調査", "まとめて", "要約"],
+            )
+            if not objective or _is_generic_objective_text(objective):
+                objective = text
+            if _is_non_code_objective(objective):
+                await ctx.reply(
+                    "自然文解釈: 非コード系タスクのため専用要約処理 `!summarize` に切り替えて実行します。"
+                    f"\nobjective={objective[:300]}"
+                )
+                return await invoke_objective("summarize", objective)
+            return await invoke_objective("deliver", objective)
+
+        if "supervise" in lowered or "監督" in text:
+            objective = _extract_after_keyword(text, ["!supervise", "supervise", "監督"])
+            if not objective:
+                objective = text
+            return await invoke_objective("supervise", objective)
+
+        if "autopr" in lowered or ("pr" in lowered and ("準備" in text or "作成" in text)):
+            objective = _extract_after_keyword(text, ["!autopr", "autopr", "pr"])
+            if not objective:
+                objective = text
+            return await invoke_objective("autopr", objective)
+
+        if "agent" in lowered or "やって" in text or "実行して" in text:
+            objective = _extract_after_keyword(text, ["!agent", "agent", "やって", "実行して"])
+            if not objective:
+                objective = text
+            return await invoke_objective("agent", objective)
+
+        if _is_continuation_message(text):
+            state = registry.get(ctx.channel.id)
+            with state.lock:
+                last_objective = state.objective.strip()
+                last_mode = state.mode.strip() or "agent"
+            if not last_objective:
+                mem = get_channel_memory(ctx.channel.id)
+                last_objective = str(mem.get("last_objective", "")).strip() or str(mem.get("last_success_objective", "")).strip()
+                last_mode = str(mem.get("last_mode", "")).strip() or str(mem.get("last_success_mode", "")).strip() or last_mode
+            if last_objective:
+                objective = f"{last_objective}\n補足指示: {text}"
+                target = "deliver" if last_mode in {"deliver", "supervise", "autopr"} else "agent"
+                if _is_non_code_objective(objective):
+                    target = "summarize"
+                await ctx.reply(
+                    f"自然文解釈: 直近文脈を補完して `!{target}` を実行します。"
+                    f"\nobjective={objective[:300]}"
+                )
+                return await invoke_objective(target, objective)
+
+        return False
+
+    @bot.event
+    async def on_message(message: discord.Message) -> None:
+        if message.author.bot:
+            return
+        ctx = await bot.get_context(message)
+        if message.content.strip().startswith("!"):
+            await bot.process_commands(message)
+            return
+        handled = await _dispatch_natural_language(ctx)
+        if not handled:
+            await bot.process_commands(message)
 
     async def with_channel_lock(ctx: commands.Context, mode: str, objective: str) -> ChannelRunState | None:
         if not is_allowed_channel(ctx.channel.id):
@@ -931,6 +2250,42 @@ def main() -> int:
             if profile_note:
                 state.profile_note = profile_note
 
+    async def run_non_code_direct(
+        ctx: commands.Context,
+        *,
+        objective: str,
+        mode: str = "summarize",
+        prefix: str = "完了 mode=summarize",
+    ) -> None:
+        state = await with_channel_lock(ctx, mode, objective)
+        if state is None:
+            return
+        await ctx.reply(f"開始 mode={mode}\nobjective={objective}")
+        try:
+            summary_path = _write_non_code_summary(workdir, objective)
+            final = "Finished: non-code summary generated."
+            note = f"route=non_code_direct\nsummary={summary_path}"
+            release_state(state, final, "n/a(non-llm)", note)
+            update_channel_memory(
+                ctx.channel.id,
+                mode=mode,
+                objective=objective,
+                final=final,
+                run_log="n/a(non-llm)",
+            )
+            await send_with_coach(
+                ctx,
+                mode=mode,
+                objective=objective,
+                final=final,
+                run_log="n/a(non-llm)",
+                note=note,
+                prefix=prefix,
+            )
+        except Exception as exc:
+            release_state(state, f"error: {type(exc).__name__}: {exc}")
+            await ctx.send(f"エラーで停止しました: {type(exc).__name__}: {exc}")
+
     @bot.command(name="status")
     async def status_cmd(ctx: commands.Context) -> None:
         if not is_allowed_channel(ctx.channel.id):
@@ -949,6 +2304,35 @@ def main() -> int:
                 return
         await ctx.reply("実行履歴はまだありません。`!agent <指示>` で開始できます。")
 
+    @bot.command(name="memory_status")
+    async def memory_status_cmd(ctx: commands.Context) -> None:
+        if not is_allowed_channel(ctx.channel.id):
+            return
+        mem = get_channel_memory(ctx.channel.id)
+        recent = mem.get("recent_objectives", [])
+        if not isinstance(recent, list):
+            recent = []
+        tail = [str(item)[:120] for item in recent[-3:]]
+        await ctx.reply(
+            "memory_status\n"
+            f"last_mode={mem.get('last_mode', '(none)')}\n"
+            f"last_objective={mem.get('last_objective', '(none)')}\n"
+            f"last_success_mode={mem.get('last_success_mode', '(none)')}\n"
+            f"last_success_objective={mem.get('last_success_objective', '(none)')}\n"
+            f"last_run_at={mem.get('last_run_at', '(none)')}\n"
+            f"recent={tail if tail else '(none)'}"
+        )
+
+    @bot.command(name="memory_clear")
+    async def memory_clear_cmd(ctx: commands.Context) -> None:
+        if not is_allowed_channel(ctx.channel.id):
+            return
+        key = str(ctx.channel.id)
+        with conversation_memory_lock:
+            conversation_memory.pop(key, None)
+            path = _save_conversation_memory(project_root, conversation_memory)
+        await ctx.reply(f"このチャンネルの会話メモリをクリアしました: {path}")
+
     @bot.command(name="cancel")
     async def cancel_cmd(ctx: commands.Context) -> None:
         if not is_allowed_channel(ctx.channel.id):
@@ -960,6 +2344,205 @@ def main() -> int:
                 return
             state.cancelled = True
         await ctx.reply("キャンセル要求を受け付けました。次のステップ境界で停止します。")
+
+    @bot.command(name="coach_on")
+    async def coach_on_cmd(ctx: commands.Context) -> None:
+        if not is_allowed_channel(ctx.channel.id):
+            return
+        coach_states[ctx.channel.id] = True
+        await ctx.reply("coach mode を有効化しました。")
+
+    @bot.command(name="coach_off")
+    async def coach_off_cmd(ctx: commands.Context) -> None:
+        if not is_allowed_channel(ctx.channel.id):
+            return
+        coach_states[ctx.channel.id] = False
+        await ctx.reply("coach mode を無効化しました。")
+
+    @bot.command(name="coach_status")
+    async def coach_status_cmd(ctx: commands.Context) -> None:
+        if not is_allowed_channel(ctx.channel.id):
+            return
+        enabled = is_coach_enabled(ctx.channel.id)
+        await ctx.reply(f"coach mode: {'ON' if enabled else 'OFF'}")
+
+    @bot.command(name="plan_day")
+    async def plan_day_cmd(ctx: commands.Context, *, objective: str) -> None:
+        if not is_allowed_channel(ctx.channel.id):
+            return
+        plan_text = _build_day_plan(objective)
+        plan_path = project_root / "runs" / "day_plan.md"
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        plan_path.write_text(plan_text, encoding="utf-8")
+        reply = f"day plan を生成しました: {plan_path}"
+        if is_coach_enabled(ctx.channel.id):
+            reply += "\n次の1手: 最優先1件だけを `!deliver ...` で実行してください。"
+        await ctx.reply(reply)
+
+    @bot.command(name="summarize")
+    async def summarize_cmd(ctx: commands.Context, *, objective: str) -> None:
+        if not is_allowed_channel(ctx.channel.id):
+            return
+        await run_non_code_direct(
+            ctx,
+            objective=objective,
+            mode="summarize",
+            prefix="完了 mode=summarize",
+        )
+
+    @bot.command(name="routine_morning")
+    async def routine_morning_cmd(ctx: commands.Context) -> None:
+        if not is_allowed_channel(ctx.channel.id):
+            return
+        path = project_root / "runs" / "routine_morning.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_routine_template("morning"), encoding="utf-8")
+        reply = f"朝ルーティンを生成しました: {path}"
+        if is_coach_enabled(ctx.channel.id):
+            reply += "\n次の1手: 1件だけ実行対象を決めて `!deliver ...` を実行。"
+        await ctx.reply(reply)
+
+    @bot.command(name="routine_night")
+    async def routine_night_cmd(ctx: commands.Context) -> None:
+        if not is_allowed_channel(ctx.channel.id):
+            return
+        path = project_root / "runs" / "routine_night.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_routine_template("night"), encoding="utf-8")
+        reply = f"夜ルーティンを生成しました: {path}"
+        if is_coach_enabled(ctx.channel.id):
+            reply += "\n次の1手: `runs/summary.md` を更新して明日の1手を1行で確定。"
+        await ctx.reply(reply)
+
+    @bot.command(name="auto_on")
+    async def auto_on_cmd(ctx: commands.Context, interval_seconds: int | None = None) -> None:
+        if not is_allowed_channel(ctx.channel.id):
+            return
+        auto = get_autopilot_state(ctx.channel.id)
+        if interval_seconds is not None:
+            auto.interval_seconds = max(60, interval_seconds)
+        auto.enabled = True
+        if auto.task is None or auto.task.done():
+            auto.task = asyncio.create_task(_autopilot_loop(ctx.channel.id))
+        await ctx.reply(
+            "autopilotを有効化しました。\n"
+            f"interval_seconds={auto.interval_seconds}\n"
+            f"objectives={len(auto.objectives)}"
+        )
+
+    @bot.command(name="auto_off")
+    async def auto_off_cmd(ctx: commands.Context) -> None:
+        if not is_allowed_channel(ctx.channel.id):
+            return
+        auto = get_autopilot_state(ctx.channel.id)
+        auto.enabled = False
+        if auto.task is not None:
+            auto.task.cancel()
+            auto.task = None
+        await ctx.reply("autopilotを停止しました。")
+
+    @bot.command(name="auto_status")
+    async def auto_status_cmd(ctx: commands.Context) -> None:
+        if not is_allowed_channel(ctx.channel.id):
+            return
+        auto = get_autopilot_state(ctx.channel.id)
+        history = _tail_autopilot_history(project_root, limit=20)
+        success_count = sum(1 for row in history if bool(row.get("success")))
+        fail_count = len(history) - success_count
+        await ctx.reply(
+            "autopilot状態\n"
+            f"enabled={auto.enabled}\n"
+            f"interval_seconds={auto.interval_seconds}\n"
+            f"objectives={len(auto.objectives)}\n"
+            f"last_run_at={auto.last_run_at or '(none)'}\n"
+            f"last_final={auto.last_final or '(none)'}\n"
+            f"last_log={auto.last_log or '(none)'}\n"
+            f"last_daily_summary_date={auto.last_daily_summary_date or '(none)'}\n"
+            f"last_daily_summary_path={auto.last_daily_summary_path or '(none)'}\n"
+            f"history_recent={len(history)} success={success_count} fail={fail_count}"
+        )
+
+    @bot.command(name="auto_now")
+    async def auto_now_cmd(ctx: commands.Context) -> None:
+        if not is_allowed_channel(ctx.channel.id):
+            return
+        ok, message = await _run_autopilot_once(ctx.channel.id, trigger="manual")
+        if not ok:
+            await ctx.reply(f"autopilot単発実行をスキップ: {message}")
+            return
+        await _maybe_post_daily_summary(ctx.channel.id)
+
+    @bot.command(name="auto_set")
+    async def auto_set_cmd(ctx: commands.Context, *, objectives: str) -> None:
+        if not is_allowed_channel(ctx.channel.id):
+            return
+        values = [item.strip() for item in objectives.split("||") if item.strip()]
+        if not values:
+            await ctx.reply("設定対象が空です。`||` 区切りで1件以上指定してください。")
+            return
+        auto = get_autopilot_state(ctx.channel.id)
+        auto.objectives = values
+        auto.next_index = 0
+        path = _save_autopilot_objectives(project_root, values)
+        await ctx.reply(
+            "autopilot目標を更新しました。\n"
+            f"count={len(values)}\n"
+            f"profile={path}"
+        )
+
+    @bot.command(name="auto_daily")
+    async def auto_daily_cmd(ctx: commands.Context) -> None:
+        if not is_allowed_channel(ctx.channel.id):
+            return
+        await _maybe_post_daily_summary(ctx.channel.id, force=True)
+
+    @bot.command(name="voice")
+    async def voice_cmd(ctx: commands.Context, mode: str = "agent") -> None:
+        if not is_allowed_channel(ctx.channel.id):
+            return
+        selected_mode = mode.strip().lower()
+        if selected_mode not in {"agent", "deliver", "supervise"}:
+            await ctx.reply("modeは `agent` / `deliver` / `supervise` のみ指定できます。例: `!voice deliver`")
+            return
+        if not ctx.message.attachments:
+            await ctx.reply("音声ファイルを添付してください。例: `!voice agent` + m4a/mp3/wav")
+            return
+        attachment = ctx.message.attachments[0]
+        max_mb = max(1, _env_int("DISCORD_VOICE_MAX_MB", 30))
+        if attachment.size > max_mb * 1024 * 1024:
+            await ctx.reply(f"音声ファイルが大きすぎます（上限: {max_mb}MB）。")
+            return
+        suffix = Path(attachment.filename or "voice.m4a").suffix or ".m4a"
+        with tempfile.NamedTemporaryFile(prefix="voice-", suffix=suffix, delete=False) as tmp:
+            temp_path = Path(tmp.name)
+        try:
+            await attachment.save(temp_path)
+            transcript = await asyncio.to_thread(_transcribe_audio_file, temp_path)
+        except Exception as exc:
+            await ctx.reply(f"音声文字起こしに失敗しました: {type(exc).__name__}: {exc}")
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if not transcript:
+            await ctx.reply("文字起こし結果が空でした。もう一度試してください。")
+            return
+        await ctx.reply(
+            "音声を文字起こししました。\n"
+            f"mode={selected_mode}\n"
+            f"objective={transcript[:500]}"
+        )
+        if selected_mode == "agent":
+            await agent_cmd(ctx, objective=transcript)
+        elif selected_mode == "deliver":
+            await deliver_cmd(ctx, objective=transcript)
+        else:
+            await supervise_cmd(ctx, objective=transcript)
 
     @bot.command(name="runs")
     async def runs_cmd(ctx: commands.Context, count: int = 5) -> None:
@@ -1039,6 +2622,14 @@ def main() -> int:
                 "例: `feat: add deliver DoD gates and PR bundle generation`"
             )
             return
+        low_quality_reason = _low_quality_commit_message_reason(message)
+        if low_quality_reason is not None:
+            await ctx.reply(
+                "コミットメッセージ品質チェックでブロックしました。\n"
+                f"- reason: {low_quality_reason}\n"
+                "例: `feat: tighten deliver convergence and validation guardrails`"
+            )
+            return
         files = _effective_changed_files(workdir)
         forbidden_prefixes = _forbidden_path_prefixes()
         forbidden_hits = [path for path in files if any(path.startswith(prefix) for prefix in forbidden_prefixes)]
@@ -1112,8 +2703,27 @@ def main() -> int:
                 progress_hook=progress_hook,
                 worker_name="agent",
             )
+            if _is_non_code_objective(objective) and "invalid tool" in final.lower():
+                summary_path = _write_non_code_summary(workdir, objective)
+                final = "Finished: fallback non-code summary generated after planner invalid-tool loop."
+                note = f"{note}\nroute=agent_fallback_non_code\nsummary={summary_path}"
+                run_log = run_log or "n/a(non-llm-fallback)"
             release_state(state, final, run_log, note)
-            await ctx.send(f"完了\nfinal={final}\nlog={run_log}\n{note}")
+            update_channel_memory(
+                ctx.channel.id,
+                mode="agent",
+                objective=objective,
+                final=final,
+                run_log=run_log,
+            )
+            await send_with_coach(
+                ctx,
+                mode="agent",
+                objective=objective,
+                final=final,
+                run_log=run_log,
+                note=note,
+            )
         except Exception as exc:
             release_state(state, f"error: {type(exc).__name__}: {exc}")
             await ctx.send(f"エラーで停止しました: {type(exc).__name__}: {exc}")
@@ -1164,7 +2774,22 @@ def main() -> int:
         try:
             final, run_log, note = await asyncio.to_thread(run_supervised)
             release_state(state, final, run_log, note)
-            await ctx.send(f"完了 mode=supervise\n{final}\nlog={run_log}\n{note}")
+            update_channel_memory(
+                ctx.channel.id,
+                mode="supervise",
+                objective=objective,
+                final=final,
+                run_log=run_log,
+            )
+            await send_with_coach(
+                ctx,
+                mode="supervise",
+                objective=objective,
+                final=final,
+                run_log=run_log,
+                note=note,
+                prefix="完了 mode=supervise",
+            )
         except Exception as exc:
             release_state(state, f"error: {type(exc).__name__}: {exc}")
             await ctx.send(f"エラーで停止しました: {type(exc).__name__}: {exc}")
@@ -1222,7 +2847,22 @@ def main() -> int:
         try:
             final, run_log, note = await asyncio.to_thread(run_autopr)
             release_state(state, final, run_log, note)
-            await ctx.send(f"完了 mode=autopr\nfinal={final}\nlog={run_log}\n{note}")
+            update_channel_memory(
+                ctx.channel.id,
+                mode="autopr",
+                objective=objective,
+                final=final,
+                run_log=run_log,
+            )
+            await send_with_coach(
+                ctx,
+                mode="autopr",
+                objective=objective,
+                final=final,
+                run_log=run_log,
+                note=note,
+                prefix="完了 mode=autopr",
+            )
         except Exception as exc:
             release_state(state, f"error: {type(exc).__name__}: {exc}")
             await ctx.send(f"エラーで停止しました: {type(exc).__name__}: {exc}")
@@ -1249,6 +2889,100 @@ def main() -> int:
             latest_log = ""
             latest_note = ""
             impl_final = ""
+            repair_strategies: list[str] = []
+            stagnant_repair_count = 0
+            repair_type_counts: dict[str, int] = {}
+            if _is_non_code_objective(objective):
+                progress_hook("phase=implement(non_code)")
+                progress_hook("deliver_non_code_detected=switch_to_agent_style")
+                impl_final, impl_log, impl_note = _run_agent_job(
+                    project_root=project_root,
+                    workdir=workdir,
+                    objective=(
+                        f"{objective}\n"
+                        "要件: 非コード系タスクとして要点を整理し、`summary.txt` に出力して finish。"
+                    ),
+                    state=state,
+                    progress_hook=lambda m: progress_hook(f"[implement-noncode] {m}"),
+                    worker_name="deliver_non_code",
+                    max_steps_override=8,
+                    forced_allowed_tools=["read_file", "write_file", "append_file", "finish"],
+                    noop_streak_limit=2,
+                )
+                latest_log = impl_log
+                latest_note = impl_note
+
+                listing_count = _runlog_directory_listing_count(impl_log)
+                if listing_count >= 2:
+                    summary_path = _write_non_code_summary(workdir, objective)
+                    progress_hook(
+                        "non_code_summary_forced=true "
+                        f"(directory_listing_count={listing_count}, path={summary_path})"
+                    )
+
+                validation_path = project_root / "runs" / "validation_report.md"
+                dod_path = project_root / "runs" / "dod_report.md"
+                release_note_path = project_root / "runs" / "release_note.md"
+                report = (
+                    "# Validation Report\n\n"
+                    "- skipped: non-code objective; switched to agent-style summarization.\n"
+                )
+                ok = True
+                validation_path.write_text(report, encoding="utf-8")
+                alerts: list[str] = []
+                dod_ok, dod_report = _evaluate_dod(workdir, ok, alerts)
+                dod_path.write_text(dod_report, encoding="utf-8")
+                progress_hook(f"validation: ok={ok} report={validation_path}")
+
+                summary_path = _write_summary_template(
+                    workdir=workdir,
+                    project_root=project_root,
+                    objective=objective,
+                    impl_final=impl_final,
+                    validation_ok=ok,
+                    validation_report=report,
+                    alerts=alerts,
+                )
+                doc_final = (
+                    "Summary template written with sections: "
+                    "Objective, Changes, Validation, Validation Alerts, Unresolved, Next Steps."
+                )
+                progress_hook(f"[documenter] summary generated: {summary_path}")
+
+                review_report = _review_findings(workdir, project_root)
+                review_report_path = project_root / "runs" / "review_report.md"
+                review_report_path.write_text(review_report, encoding="utf-8")
+                review_ok = _review_status(project_root) == "OK"
+                status = "SUCCESS" if (ok and dod_ok and review_ok) else "NEEDS_REVIEW"
+                release_note = _make_release_note(
+                    workdir=workdir,
+                    objective=objective,
+                    deliver_status=status,
+                    implementer_final=impl_final,
+                    validation_report_path=validation_path,
+                    dod_report_path=dod_path,
+                )
+                release_note_path.write_text(release_note, encoding="utf-8")
+                pr_ready_path = _write_pr_ready_bundle(project_root, workdir)
+                final = (
+                    f"deliver={status}\n"
+                    f"implementer={impl_final}\n"
+                    "route=non_code_agent_style\n"
+                    f"documenter={doc_final}\n"
+                    f"validation_report={validation_path}\n"
+                    f"dod_report={dod_path}\n"
+                    f"release_note={release_note_path}\n"
+                    f"review_report={review_report_path}\n"
+                    f"pr_ready={pr_ready_path}\n"
+                    "repair_attempts=0/0\n"
+                    "repair_strategies=(none)\n"
+                    "repair_type_counts={}\n"
+                    "repair_stagnant_count=0\n"
+                    "validation_alerts=0\n"
+                    f"review_status={'OK' if review_ok else 'NOT_OK'}"
+                )
+                return final, latest_log, latest_note
+
             progress_hook("phase=implement")
             impl_final, impl_log, impl_note = _run_agent_job(
                 project_root=project_root,
@@ -1273,6 +3007,14 @@ def main() -> int:
             ok, report = _run_validation_suite(workdir)
             validation_path.write_text(report, encoding="utf-8")
             alerts = _extract_validation_alert_lines(report)
+            impl_flags = _runlog_quality_flags(impl_log)
+            if impl_flags:
+                alerts.append(f"implement_run_quality={','.join(impl_flags)}")
+            if _detect_no_tests_in_runlog(impl_log):
+                alerts.append("implement_phase_no_tests_detected")
+                ok = False
+            if any(flag in impl_flags for flag in ("invalid_tool_loop", "directory_listing_loop", "no_productive_action")):
+                ok = False
             dod_ok, dod_report = _evaluate_dod(workdir, ok, alerts)
             dod_path.write_text(dod_report, encoding="utf-8")
             progress_hook(f"validation: ok={ok} report={validation_path}")
@@ -1280,11 +3022,30 @@ def main() -> int:
             attempt = 0
             while not ok and attempt < max_repair_loops:
                 attempt += 1
+                base_failure_type = _classify_validation_failure(report)
+                repair_strategy = _fixed_repair_strategy(base_failure_type, attempt)
+                repair_strategies.append(repair_strategy)
+                repair_type_counts[repair_strategy] = repair_type_counts.get(repair_strategy, 0) + 1
+                type_limit = _repair_attempt_limit(repair_strategy, max_repair_loops)
+                if repair_type_counts[repair_strategy] > type_limit:
+                    progress_hook(
+                        "repair_stop=type_attempt_limit "
+                        f"failure_type={repair_strategy} limit={type_limit}"
+                    )
+                    break
                 progress_hook(f"phase=repair attempt={attempt}")
-                fix_objective = (
-                    "以下の検証レポートに基づいて失敗を修正してください。"
-                    f"\nreport_path=runs/validation_report.md\n\n{objective}"
+                progress_hook(f"repair_strategy={repair_strategy} (base={base_failure_type})")
+                if repair_strategy == "permission_failure":
+                    alerts.append("permission_failure_manual_intervention_required")
+                    progress_hook("repair_stop=permission_failure requires manual intervention")
+                    ok = False
+                    break
+                fix_objective = _build_repair_objective_with_stagnation_note(
+                    objective,
+                    repair_strategy,
+                    stagnant_repair_count,
                 )
+                pre_fp = _worktree_fingerprint(workdir)
                 fix_final, fix_log, fix_note = _run_agent_job(
                     project_root=project_root,
                     workdir=workdir,
@@ -1296,33 +3057,53 @@ def main() -> int:
                     forced_allowed_tools=["read_file", "write_file", "shell", "finish"],
                     noop_streak_limit=3,
                 )
+                post_fp = _worktree_fingerprint(workdir)
+                if post_fp == pre_fp:
+                    stagnant_repair_count += 1
+                    progress_hook(
+                        "repair_progress=stagnant "
+                        f"(count={stagnant_repair_count}, fp={post_fp})"
+                    )
+                else:
+                    stagnant_repair_count = 0
                 latest_log = fix_log
                 latest_note = fix_note
                 ok, report = _run_validation_suite(workdir)
                 validation_path.write_text(report, encoding="utf-8")
                 alerts = _extract_validation_alert_lines(report)
+                fix_flags = _runlog_quality_flags(fix_log)
+                if fix_flags:
+                    alerts.append(f"repair_run_quality={','.join(fix_flags)}")
+                if _detect_no_tests_in_runlog(fix_log):
+                    alerts.append("repair_phase_no_tests_detected")
+                    ok = False
+                if any(flag in fix_flags for flag in ("invalid_tool_loop", "directory_listing_loop", "no_productive_action")):
+                    ok = False
                 dod_ok, dod_report = _evaluate_dod(workdir, ok, alerts)
                 dod_path.write_text(dod_report, encoding="utf-8")
                 progress_hook(f"validation_retry: ok={ok} attempt={attempt}")
+                stagnant_limit = _repair_stagnant_limit(repair_strategy)
+                if not ok and stagnant_repair_count >= stagnant_limit:
+                    progress_hook(
+                        "repair_stop=stagnant_repair "
+                        f"failure_type={repair_strategy} limit={stagnant_limit}"
+                    )
+                    break
 
-            alert_text = "\n".join(f"- {line}" for line in alerts) if alerts else "- (none)"
-            doc_objective = (
-                "以下の必須見出しで `runs/summary.md` を更新すること: "
-                "Objective, Changes, Validation, Unresolved, Next Steps. "
-                "Validationは `runs/validation_report.md` を参照して記述する。"
-                "\nさらに Validation Alerts セクションを作り、以下の抽出行を必ず転記すること:\n"
-                f"{alert_text}"
-            )
-            doc_final, doc_log, doc_note = _run_agent_job(
-                project_root=project_root,
+            summary_path = _write_summary_template(
                 workdir=workdir,
-                objective=doc_objective,
-                state=state,
-                progress_hook=lambda m: progress_hook(f"[documenter] {m}"),
-                worker_name="documenter",
+                project_root=project_root,
+                objective=objective,
+                impl_final=impl_final,
+                validation_ok=ok,
+                validation_report=report,
+                alerts=alerts,
             )
-            latest_log = doc_log
-            latest_note = doc_note
+            doc_final = (
+                "Summary template written with sections: "
+                "Objective, Changes, Validation, Validation Alerts, Unresolved, Next Steps."
+            )
+            progress_hook(f"[documenter] summary generated: {summary_path}")
 
             implementer_bad = (
                 "stopped:" in impl_final.lower()
@@ -1360,6 +3141,9 @@ def main() -> int:
                 f"review_report={review_report_path}\n"
                 f"pr_ready={pr_ready_path}\n"
                 f"repair_attempts={attempt}/{max_repair_loops}\n"
+                f"repair_strategies={','.join(repair_strategies) if repair_strategies else '(none)'}\n"
+                f"repair_type_counts={repair_type_counts}\n"
+                f"repair_stagnant_count={stagnant_repair_count}\n"
                 f"validation_alerts={len(alerts)}\n"
                 f"review_status={'OK' if review_ok else 'NOT_OK'}"
             )
@@ -1368,7 +3152,22 @@ def main() -> int:
         try:
             final, run_log, note = await asyncio.to_thread(run_deliver)
             release_state(state, final, run_log, note)
-            await ctx.send(f"完了 mode=deliver\n{final}\nlog={run_log}\n{note}")
+            update_channel_memory(
+                ctx.channel.id,
+                mode="deliver",
+                objective=objective,
+                final=final,
+                run_log=run_log,
+            )
+            await send_with_coach(
+                ctx,
+                mode="deliver",
+                objective=objective,
+                final=final,
+                run_log=run_log,
+                note=note,
+                prefix="完了 mode=deliver",
+            )
         except Exception as exc:
             release_state(state, f"error: {type(exc).__name__}: {exc}")
             await ctx.send(f"エラーで停止しました: {type(exc).__name__}: {exc}")

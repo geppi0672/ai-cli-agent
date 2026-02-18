@@ -141,6 +141,10 @@ python -m agent.discord_bot --workdir /Users/tanaka/ai-cli-agent
   - 許可ツールは `read_file/write_file/shell` に制限
   - `shell` は `pytest/compileall` 系のみ許可
   - `runs/validation_report.md` から失敗/警告行を抽出し、`runs/summary.md` に転記
+  - documenter は固定テンプレで `runs/summary.md` を生成（LLM迷走を抑制）
+  - 修復フェーズは失敗タイプ別に分岐（`test_failure` / `syntax_failure` / `permission_failure`）
+  - 権限/認証系失敗は無限ループを避けて早期停止し、手動対応を促す
+  - 修復で差分が増えない停滞を検知し、連続時は早期停止して手動レビューへ切り替える
   - 成功条件は `validation all green` かつ `validation alerts=0` かつ `implementer重大停止なし` かつ `DoD=PASS`
   - さらに `review=OK` も `deliver=SUCCESS` の必須条件
   - `runs/dod_report.md` を生成（変更ファイル数上限・禁止パス変更を検査）
@@ -149,6 +153,8 @@ python -m agent.discord_bot --workdir /Users/tanaka/ai-cli-agent
 - `!autopr <objective>` : branch + implementation/test + PR artifact generation
 - `!review` : current diff を `Critical/High/Medium` で自動査読（`runs/review_report.md` 出力）
 - `!status` : check running/latest status
+- `!memory_status` : チャンネル単位の会話メモリ（直近objective/成功履歴）を表示
+- `!memory_clear` : チャンネル単位の会話メモリをクリア
 - `!cancel` : request stop on next step boundary
 - `!runs [count]` : list latest run logs
 - `!tail [lines]` : show tail of latest run log for this channel
@@ -156,9 +162,33 @@ python -m agent.discord_bot --workdir /Users/tanaka/ai-cli-agent
 - `!approve <commit message>` : `git add -A` + `git commit`
   - 既定で `DoD=PASS` かつ `review=OK` のときのみ実行（未達はブロック）
   - `<message>` などのダミー文言は拒否
+  - 依頼文/低品質メッセージ（`type:` なし、短すぎる等）も拒否
   - 既定で `main/master` への直接コミットは拒否（ブランチ作成が必要）
   - Git `user.name` / `user.email` 未設定時は拒否
 - `!rollback [ref]` : safe rollback via `git revert --no-edit <ref>`
+- `!auto_on [interval_seconds]` : 無指示時の定型タスク自動実行を開始
+- `!auto_off` : 自動実行を停止
+- `!auto_status` : 自動実行の状態確認
+- `!auto_now` : 自動実行を1回だけ即時実行
+- `!auto_set <obj1 || obj2 ...>` : あなた専用の autopilot 目標を更新して保存
+- `!auto_daily` : 日次サマリ (`runs/daily_summary.md`) を即時生成
+- `!plan_day <objective>` : 1日の実行計画を `runs/day_plan.md` に生成（朝/夜の固定ルーティン付き）
+- `!routine_morning` : 朝ルーティンの固定テンプレを `runs/routine_morning.md` に生成
+- `!routine_night` : 夜ルーティンの固定テンプレを `runs/routine_night.md` に生成
+- `!coach_on / !coach_off / !coach_status` : 実行完了メッセージに「次の1手」を自動添付するモードの制御
+- `!summarize <objective>` : 非コード系（調査/要約）を専用フローで実行し `summary.txt` を更新（要点3 / 未確定事項 / 次アクション）
+  - 出力に `Citations (Required)` を含め、`url/date/reliability` を必須表示
+- `!voice [agent|deliver|supervise]` : 添付音声を文字起こしして、そのまま指定モードで実行
+- `!` なし自然文でも主要操作を実行可能（例: 「今日の計画を作って」「これ承認して feat: ...」）
+  - 非コード系（リサーチ/要約/調査など）は `deliver` 指示でも自動で `summarize` 実行へ切替
+  - 「続きやって」「これお願い」などは直近objectiveを補完して再実行
+  - 再起動後も `.agent_state/conversation_memory.json` の履歴を使って文脈補完
+  - 自然文の approve は「はい/いいえ」の確認を挟んで実行
+- autopilot は安全のため `read_file/write_file/finish` のみ使用（`shell` は禁止）
+- autopilot の書き込み先は `runs/auto_todo.md` と `runs/auto_health.md` のみに制限
+- autopilot 失敗時は `runs/manual_checklist.md` を自動生成
+- autopilot 実行履歴は `.agent_state/autopilot_history.jsonl` に保存
+- autopilot 変更にもガードレポート (`runs/autopilot_guard_report.md`) を適用
 - `supervise` の tester はプロジェクト種別を自動判定し、Pythonプロジェクトでは `pytest/compileall` 系のみ許可
 
 4. Optional Discord runtime env:
@@ -173,6 +203,20 @@ DISCORD_MIN_DIFF_LINES=1
 DISCORD_FAIL_ON_NO_TESTS=true
 DISCORD_ENFORCE_APPROVE_GATES=true
 DISCORD_ENFORCE_APPROVE_BRANCH=true
+DISCORD_AUTOPILOT_INTERVAL_SECONDS=900
+DISCORD_AUTOPILOT_MAX_STEPS=8
+DISCORD_AUTOPILOT_OBJECTIVES=リポジトリ状態を確認して runs/auto_todo.md を更新してfinish||直近runログを要約して runs/auto_health.md を更新してfinish
+DISCORD_AUTOPILOT_MAX_CHANGED_FILES=20
+DISCORD_AUTOPILOT_ALLOWED_PREFIXES=runs/
+DISCORD_COACH_MODE_DEFAULT=true
+DISCORD_NL_ENABLED=true
+DISCORD_APPROVE_CONFIRM_NL=true
+OPENAI_TRANSCRIBE_MODEL=gpt-4o-mini-transcribe
+DISCORD_VOICE_MAX_MB=30
+DISCORD_REPAIR_TEST_MAX_ATTEMPTS=3
+DISCORD_REPAIR_SYNTAX_MAX_ATTEMPTS=2
+DISCORD_REPAIR_PERMISSION_MAX_ATTEMPTS=1
+DISCORD_REPAIR_UNKNOWN_MAX_ATTEMPTS=2
 ```
 
 - `allow`: non-safe shell/external calls are allowed automatically
@@ -187,6 +231,25 @@ DISCORD_ENFORCE_APPROVE_BRANCH=true
 - `DISCORD_FAIL_ON_NO_TESTS` は `pytest` の `no tests ran / collected 0 items` を検証失敗扱いにする（既定 `true`）
 - `DISCORD_ENFORCE_APPROVE_GATES` は `!approve` の DoD/Review ゲート強制（既定 `true`）
 - `DISCORD_ENFORCE_APPROVE_BRANCH` は `main/master` 直コミット拒否を有効化（既定 `true`）
+- `DISCORD_AUTOPILOT_INTERVAL_SECONDS` は autopilot 実行間隔（秒）
+- `DISCORD_AUTOPILOT_MAX_STEPS` は autopilot 1回あたりのステップ上限
+- `DISCORD_AUTOPILOT_OBJECTIVES` は autopilot の定型目標（`||` 区切り）
+- `!auto_set` で設定した目標は `.agent_state/autopilot_objectives.txt` に保存され、次回起動時も再利用
+- `DISCORD_AUTOPILOT_MAX_CHANGED_FILES` は autopilot 実行後の変更ファイル上限
+- `DISCORD_AUTOPILOT_ALLOWED_PREFIXES` は autopilot で変更を許可するパス接頭辞（`,` 区切り）
+- `DISCORD_COACH_MODE_DEFAULT` はコーチモードの既定ON/OFF（既定 `true`）
+- `DISCORD_NL_ENABLED` は `!` なし自然文ルーティングの有効化（既定 `true`）
+- `DISCORD_APPROVE_CONFIRM_NL` は自然文 approve 実行前の「はい/いいえ」確認（既定 `true`）
+- `OPENAI_TRANSCRIBE_MODEL` は音声文字起こしモデル（既定: `gpt-4o-mini-transcribe`）
+- `DISCORD_VOICE_MAX_MB` は音声添付サイズ上限（MB）
+- `DISCORD_REPAIR_*_MAX_ATTEMPTS` は失敗タイプ別の修復試行上限
+- implement/repair フェーズで `no tests ran / collected 0 items` が出た場合は `deliver` を失敗側に倒す
+- 非コード系 objective を `deliver` で受けた場合は agent-style 実行に切替し、検証は `skipped` 扱いでレポート化
+- 非コード系 objective で `agent` が invalid-tool 連発時は `summary.txt` 生成へ自動フォールバック
+- `deliver` は run log 品質（invalid-tool loop / directory listing loop / no productive action）を検知し、完了判定を厳格化
+- 修復戦略は失敗タイプ別の固定ローテーション（`test -> syntax -> unknown` など）で迷走を抑制
+- `summarize` の入力源優先順位は `research_data.txt` → `runs/day_plan.md` → `runs/summary.md`
+- `summarize` は事実/推測を分離して出力（`[fact]` / `[inference]`）
 
 Additional runtime safeguards:
 
