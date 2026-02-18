@@ -168,8 +168,11 @@ python -m agent.discord_bot --workdir /Users/tanaka/ai-cli-agent
 - `!auto_off` : 自動実行を停止
 - `!auto_status` : 自動実行の状態確認
 - `!auto_now` : 自動実行を1回だけ即時実行
+- `!auto_set <obj1 || obj2 ...>` : あなた専用の autopilot 目標を更新して保存
+- `!auto_daily` : 日次サマリ (`runs/daily_summary.md`) を即時生成
 - autopilot は安全のため `read_file/write_file/finish` のみ使用（`shell` は禁止）
 - autopilot の書き込み先は `runs/*.md` のみに制限
+- autopilot 失敗時は `runs/manual_checklist.md` を自動生成
 - `supervise` の tester はプロジェクト種別を自動判定し、Pythonプロジェクトでは `pytest/compileall` 系のみ許可
 
 4. Optional Discord runtime env:
@@ -204,6 +207,7 @@ DISCORD_AUTOPILOT_OBJECTIVES=リポジトリ状態を確認して runs/auto_todo
 - `DISCORD_AUTOPILOT_INTERVAL_SECONDS` は autopilot 実行間隔（秒）
 - `DISCORD_AUTOPILOT_MAX_STEPS` は autopilot 1回あたりのステップ上限
 - `DISCORD_AUTOPILOT_OBJECTIVES` は autopilot の定型目標（`||` 区切り）
+- `!auto_set` で設定した目標は `.agent_state/autopilot_objectives.txt` に保存され、次回起動時も再利用
 
 Additional runtime safeguards:
 

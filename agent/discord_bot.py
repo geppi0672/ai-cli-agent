@@ -61,6 +61,8 @@ class AutoPilotState:
     last_run_at: str = ""
     last_final: str = ""
     last_log: str = ""
+    last_daily_summary_date: str = ""
+    last_daily_summary_path: str = ""
     task: asyncio.Task[None] | None = None
 
 
@@ -112,6 +114,10 @@ def _failure_profile_path(project_root: Path) -> Path:
     return project_root / ".agent_state" / "failure_patterns.json"
 
 
+def _autopilot_objectives_path(project_root: Path) -> Path:
+    return project_root / ".agent_state" / "autopilot_objectives.txt"
+
+
 def _build_external_adapters(enable: bool) -> dict[str, ExternalAgentAdapter]:
     if not enable:
         return {}
@@ -134,18 +140,32 @@ def _load_allowed_channel_ids() -> set[int]:
 
 def _default_autopilot_objectives() -> list[str]:
     return [
-        "リポジトリの現状を確認し、次に進める小さな改善案を最大3件 `runs/auto_todo.md` に追記して finish する。",
-        "直近 run ログを確認し、失敗傾向の要約を `runs/auto_health.md` に更新して finish する。",
+        "あなた専用タスク: 直近作業から次の小さな一手を3件に絞り、`runs/auto_todo.md` を更新して finish する。",
+        "あなた専用タスク: 直近runログを見て失敗/停滞の傾向を1分で読める形で `runs/auto_health.md` に更新して finish する。",
     ]
 
 
-def _load_autopilot_objectives() -> list[str]:
+def _load_autopilot_objectives(project_root: Path) -> list[str]:
+    profile_file = _autopilot_objectives_path(project_root)
+    if profile_file.exists():
+        rows = [line.strip() for line in profile_file.read_text(encoding="utf-8").splitlines()]
+        saved = [line for line in rows if line and not line.startswith("#")]
+        if saved:
+            return saved
     raw = os.getenv("DISCORD_AUTOPILOT_OBJECTIVES", "").strip()
     if not raw:
         return _default_autopilot_objectives()
     parts = [item.strip() for item in raw.split("||")]
     values = [item for item in parts if item]
     return values or _default_autopilot_objectives()
+
+
+def _save_autopilot_objectives(project_root: Path, objectives: list[str]) -> Path:
+    path = _autopilot_objectives_path(project_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = "\n".join(objectives) + "\n"
+    path.write_text(payload, encoding="utf-8")
+    return path
 
 
 def _env_bool(key: str, default: bool) -> bool:
@@ -642,6 +662,87 @@ def _is_git_repo(workdir: Path) -> bool:
 def _latest_logs(runs_dir: Path, limit: int = 5) -> list[Path]:
     files = sorted(runs_dir.glob("run-*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
     return files[: max(1, limit)]
+
+
+def _infer_failure_kind(text: str) -> str:
+    lowered = text.lower()
+    if any(token in lowered for token in ("permission denied", "authentication", "forbidden", "blocked")):
+        return "permission_failure"
+    if any(
+        token in lowered
+        for token in ("syntaxerror", "jsondecodeerror", "indentationerror", "typeerror", "traceback")
+    ):
+        return "syntax_failure"
+    if any(token in lowered for token in ("pytest", "failed", "assert", "no tests ran", "collected 0 items")):
+        return "test_failure"
+    return "unknown_failure"
+
+
+def _write_manual_checklist(
+    project_root: Path,
+    objective: str,
+    final_message: str,
+    run_log: str,
+) -> Path:
+    failure_kind = _infer_failure_kind(final_message)
+    path = project_root / "runs" / "manual_checklist.md"
+    lines = [
+        "# Manual Checklist",
+        "",
+        f"- generated_at: {datetime.now(UTC).isoformat()}",
+        f"- failure_kind: {failure_kind}",
+        f"- objective: {objective}",
+        f"- final: {final_message}",
+        f"- run_log: {run_log or '(none)'}",
+        "",
+        "## Actions",
+        "- 1) run `!status` and confirm current state",
+        "- 2) read `runs/validation_report.md` and identify the first failing command",
+        "- 3) run `!review` and check Critical/High findings",
+        "- 4) apply minimal fix and rerun `!deliver ...`",
+        "- 5) if auth/permission related, refresh credentials and retry",
+        "",
+        "## Notes",
+        "- このチェックリストは自動生成です。必要に応じて追記してください。",
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def _write_daily_summary(project_root: Path, auto: AutoPilotState) -> Path:
+    runs_dir = project_root / "runs"
+    summary_path = runs_dir / "daily_summary.md"
+    latest = _latest_logs(runs_dir, limit=5)
+    auto_todo = runs_dir / "auto_todo.md"
+    auto_health = runs_dir / "auto_health.md"
+    todo_text = auto_todo.read_text(encoding="utf-8")[:1200] if auto_todo.exists() else "(none)"
+    health_text = auto_health.read_text(encoding="utf-8")[:1200] if auto_health.exists() else "(none)"
+    lines = [
+        "# Daily Summary",
+        "",
+        f"- date: {datetime.now(UTC).date().isoformat()}",
+        f"- autopilot_last_run: {auto.last_run_at or '(none)'}",
+        f"- autopilot_last_final: {auto.last_final or '(none)'}",
+        "",
+        "## Latest Runs",
+    ]
+    lines.extend([f"- {item.name}" for item in latest] or ["- (none)"])
+    lines.extend(
+        [
+            "",
+            "## Auto TODO",
+            "```text",
+            todo_text,
+            "```",
+            "",
+            "## Auto Health",
+            "```text",
+            health_text,
+            "```",
+        ]
+    )
+    summary_path.write_text("\n".join(lines), encoding="utf-8")
+    return summary_path
 
 
 def _detect_project_type(workdir: Path) -> str:
@@ -1157,7 +1258,7 @@ def main() -> int:
             autopilot_states[channel_id] = AutoPilotState(
                 enabled=False,
                 interval_seconds=max(60, _env_int("DISCORD_AUTOPILOT_INTERVAL_SECONDS", 900)),
-                objectives=_load_autopilot_objectives(),
+                objectives=_load_autopilot_objectives(project_root),
             )
         return autopilot_states[channel_id]
 
@@ -1212,6 +1313,14 @@ def main() -> int:
             auto.last_run_at = datetime.now(UTC).isoformat()
             auto.last_final = final
             auto.last_log = run_log
+            final_lower = final.lower()
+            if any(token in final_lower for token in ("stopped:", "needs_review", "error", "failed")):
+                checklist_path = _write_manual_checklist(project_root, objective, final, run_log)
+                if isinstance(channel, discord.abc.Messageable):
+                    try:
+                        await channel.send(f"autopilot失敗チェックリストを生成しました: {checklist_path}")
+                    except Exception:
+                        pass
             if isinstance(channel, discord.abc.Messageable):
                 try:
                     await channel.send(
@@ -1232,17 +1341,33 @@ def main() -> int:
                     pass
             return False, err
 
+    async def _maybe_post_daily_summary(channel_id: int, force: bool = False) -> None:
+        auto = get_autopilot_state(channel_id)
+        today = datetime.now(UTC).date().isoformat()
+        if not force and auto.last_daily_summary_date == today:
+            return
+        summary_path = _write_daily_summary(project_root, auto)
+        auto.last_daily_summary_date = today
+        auto.last_daily_summary_path = str(summary_path)
+        channel = bot.get_channel(channel_id)
+        if isinstance(channel, discord.abc.Messageable):
+            try:
+                await channel.send(f"daily_summary更新: {summary_path}")
+            except Exception:
+                pass
+
     async def _autopilot_loop(channel_id: int) -> None:
         auto = get_autopilot_state(channel_id)
         while auto.enabled:
             await _run_autopilot_once(channel_id, trigger="timer")
+            await _maybe_post_daily_summary(channel_id)
             await asyncio.sleep(max(30, auto.interval_seconds))
 
     @bot.event
     async def on_ready() -> None:
         print(f"Discord bot logged in as {bot.user}", flush=True)
         print(
-            "Commands: !agent !supervise !deliver !autopr !review !status !cancel !runs !tail !diff !approve !rollback !auto_on !auto_off !auto_status !auto_now",
+            "Commands: !agent !supervise !deliver !autopr !review !status !cancel !runs !tail !diff !approve !rollback !auto_on !auto_off !auto_status !auto_now !auto_set !auto_daily",
             flush=True,
         )
 
@@ -1357,7 +1482,9 @@ def main() -> int:
             f"objectives={len(auto.objectives)}\n"
             f"last_run_at={auto.last_run_at or '(none)'}\n"
             f"last_final={auto.last_final or '(none)'}\n"
-            f"last_log={auto.last_log or '(none)'}"
+            f"last_log={auto.last_log or '(none)'}\n"
+            f"last_daily_summary_date={auto.last_daily_summary_date or '(none)'}\n"
+            f"last_daily_summary_path={auto.last_daily_summary_path or '(none)'}"
         )
 
     @bot.command(name="auto_now")
@@ -1367,6 +1494,32 @@ def main() -> int:
         ok, message = await _run_autopilot_once(ctx.channel.id, trigger="manual")
         if not ok:
             await ctx.reply(f"autopilot単発実行をスキップ: {message}")
+            return
+        await _maybe_post_daily_summary(ctx.channel.id)
+
+    @bot.command(name="auto_set")
+    async def auto_set_cmd(ctx: commands.Context, *, objectives: str) -> None:
+        if not is_allowed_channel(ctx.channel.id):
+            return
+        values = [item.strip() for item in objectives.split("||") if item.strip()]
+        if not values:
+            await ctx.reply("設定対象が空です。`||` 区切りで1件以上指定してください。")
+            return
+        auto = get_autopilot_state(ctx.channel.id)
+        auto.objectives = values
+        auto.next_index = 0
+        path = _save_autopilot_objectives(project_root, values)
+        await ctx.reply(
+            "autopilot目標を更新しました。\n"
+            f"count={len(values)}\n"
+            f"profile={path}"
+        )
+
+    @bot.command(name="auto_daily")
+    async def auto_daily_cmd(ctx: commands.Context) -> None:
+        if not is_allowed_channel(ctx.channel.id):
+            return
+        await _maybe_post_daily_summary(ctx.channel.id, force=True)
 
     @bot.command(name="runs")
     async def runs_cmd(ctx: commands.Context, count: int = 5) -> None:
