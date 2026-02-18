@@ -5,6 +5,7 @@ import asyncio
 import os
 import re
 import subprocess
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -12,6 +13,7 @@ from pathlib import Path
 
 import discord
 from discord.ext import commands
+from openai import OpenAI
 
 from .adapters import AntigravityAdapter, CodexAdapter, ExternalAgentAdapter
 from .budget import BudgetManager
@@ -179,6 +181,14 @@ def _env_int(key: str, default: int) -> int:
     value = os.getenv(key)
     if value is None:
         return default
+
+
+def _transcribe_audio_file(path: Path) -> str:
+    model = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe").strip() or "gpt-4o-mini-transcribe"
+    client = OpenAI()
+    with path.open("rb") as f:
+        text = client.audio.transcriptions.create(model=model, file=f, response_format="text")
+    return str(text).strip()
     try:
         return int(value)
     except ValueError:
@@ -1367,7 +1377,7 @@ def main() -> int:
     async def on_ready() -> None:
         print(f"Discord bot logged in as {bot.user}", flush=True)
         print(
-            "Commands: !agent !supervise !deliver !autopr !review !status !cancel !runs !tail !diff !approve !rollback !auto_on !auto_off !auto_status !auto_now !auto_set !auto_daily",
+            "Commands: !agent !supervise !deliver !autopr !review !status !cancel !runs !tail !diff !approve !rollback !auto_on !auto_off !auto_status !auto_now !auto_set !auto_daily !voice",
             flush=True,
         )
 
@@ -1520,6 +1530,54 @@ def main() -> int:
         if not is_allowed_channel(ctx.channel.id):
             return
         await _maybe_post_daily_summary(ctx.channel.id, force=True)
+
+    @bot.command(name="voice")
+    async def voice_cmd(ctx: commands.Context, mode: str = "agent") -> None:
+        if not is_allowed_channel(ctx.channel.id):
+            return
+        selected_mode = mode.strip().lower()
+        if selected_mode not in {"agent", "deliver", "supervise"}:
+            await ctx.reply("modeは `agent` / `deliver` / `supervise` のみ指定できます。例: `!voice deliver`")
+            return
+        if not ctx.message.attachments:
+            await ctx.reply("音声ファイルを添付してください。例: `!voice agent` + m4a/mp3/wav")
+            return
+        attachment = ctx.message.attachments[0]
+        max_mb = max(1, _env_int("DISCORD_VOICE_MAX_MB", 30))
+        if attachment.size > max_mb * 1024 * 1024:
+            await ctx.reply(f"音声ファイルが大きすぎます（上限: {max_mb}MB）。")
+            return
+        suffix = Path(attachment.filename or "voice.m4a").suffix or ".m4a"
+        with tempfile.NamedTemporaryFile(prefix="voice-", suffix=suffix, delete=False) as tmp:
+            temp_path = Path(tmp.name)
+        try:
+            await attachment.save(temp_path)
+            transcript = await asyncio.to_thread(_transcribe_audio_file, temp_path)
+        except Exception as exc:
+            await ctx.reply(f"音声文字起こしに失敗しました: {type(exc).__name__}: {exc}")
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if not transcript:
+            await ctx.reply("文字起こし結果が空でした。もう一度試してください。")
+            return
+        await ctx.reply(
+            "音声を文字起こししました。\n"
+            f"mode={selected_mode}\n"
+            f"objective={transcript[:500]}"
+        )
+        if selected_mode == "agent":
+            await agent_cmd(ctx, objective=transcript)
+        elif selected_mode == "deliver":
+            await deliver_cmd(ctx, objective=transcript)
+        else:
+            await supervise_cmd(ctx, objective=transcript)
 
     @bot.command(name="runs")
     async def runs_cmd(ctx: commands.Context, count: int = 5) -> None:
