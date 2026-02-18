@@ -259,19 +259,30 @@ def _has_git_identity(workdir: Path) -> bool:
 
 
 def _collect_changed_files(workdir: Path) -> list[str]:
-    code, out = _run_cmd("git status --porcelain", workdir)
-    if code != 0:
-        return []
+    # Use name-only lists instead of parsing porcelain columns to avoid
+    # edge cases caused by local git status formatting.
+    commands = [
+        "git diff --name-only",
+        "git diff --name-only --cached",
+        "git ls-files --others --exclude-standard",
+    ]
     files: list[str] = []
-    for raw in out.splitlines():
-        line = raw.rstrip()
-        if len(line) < 4:
+    for command in commands:
+        code, out = _run_cmd(command, workdir)
+        if code != 0 or not out or out == "(no output)":
             continue
-        path_part = line[3:]
-        if " -> " in path_part:
-            path_part = path_part.split(" -> ", 1)[1]
-        files.append(path_part.strip())
-    return files
+        for raw in out.splitlines():
+            path = raw.strip()
+            if not path:
+                continue
+            files.append(path)
+    # de-duplicate while preserving order
+    unique: list[str] = []
+    for path in files:
+        if path in unique:
+            continue
+        unique.append(path)
+    return unique
 
 
 def _runtime_noise_paths() -> tuple[str, ...]:
