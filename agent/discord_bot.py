@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import re
 import subprocess
@@ -120,6 +121,10 @@ def _autopilot_objectives_path(project_root: Path) -> Path:
     return project_root / ".agent_state" / "autopilot_objectives.txt"
 
 
+def _autopilot_history_path(project_root: Path) -> Path:
+    return project_root / ".agent_state" / "autopilot_history.jsonl"
+
+
 def _build_external_adapters(enable: bool) -> dict[str, ExternalAgentAdapter]:
     if not enable:
         return {}
@@ -168,6 +173,30 @@ def _save_autopilot_objectives(project_root: Path, objectives: list[str]) -> Pat
     payload = "\n".join(objectives) + "\n"
     path.write_text(payload, encoding="utf-8")
     return path
+
+
+def _append_autopilot_history(project_root: Path, record: dict) -> Path:
+    path = _autopilot_history_path(project_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return path
+
+
+def _tail_autopilot_history(project_root: Path, limit: int = 20) -> list[dict]:
+    path = _autopilot_history_path(project_root)
+    if not path.exists():
+        return []
+    rows = path.read_text(encoding="utf-8").splitlines()
+    out: list[dict] = []
+    for raw in rows[-max(1, limit) :]:
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            out.append(data)
+    return out
 
 
 def _env_bool(key: str, default: bool) -> bool:
@@ -290,6 +319,40 @@ def _forbidden_extension_hits(paths: list[str]) -> list[str]:
     return hits
 
 
+def _autopilot_allowed_prefixes() -> list[str]:
+    raw = os.getenv("DISCORD_AUTOPILOT_ALLOWED_PREFIXES", "").strip()
+    if raw:
+        return [item.strip() for item in raw.split(",") if item.strip()]
+    return ["runs/"]
+
+
+def _evaluate_autopilot_guard(workdir: Path, project_root: Path) -> tuple[bool, Path]:
+    all_changed = _collect_changed_files(workdir)
+    max_changed = max(1, _env_int("DISCORD_AUTOPILOT_MAX_CHANGED_FILES", 20))
+    allowed_prefixes = _autopilot_allowed_prefixes()
+    filtered = [path for path in all_changed if not _is_runtime_noise(path)]
+    disallowed = [
+        path for path in filtered if not any(path.startswith(prefix) for prefix in allowed_prefixes)
+    ]
+    ok = len(disallowed) == 0 and len(filtered) <= max_changed
+    report_path = project_root / "runs" / "autopilot_guard_report.md"
+    lines = [
+        "# Autopilot Guard Report",
+        "",
+        f"- status: {'PASS' if ok else 'FAIL'}",
+        f"- changed_files_count: {len(filtered)} (limit={max_changed})",
+        f"- disallowed_count: {len(disallowed)}",
+        f"- allowed_prefixes: {', '.join(allowed_prefixes)}",
+        "",
+        "## Changed Files",
+    ]
+    lines.extend([f"- {path}" for path in filtered[:120]] or ["- (none)"])
+    lines.extend(["", "## Disallowed"])
+    lines.extend([f"- {path}" for path in disallowed[:120]] or ["- (none)"])
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+    return ok, report_path
+
+
 def _diff_line_counts(workdir: Path) -> tuple[int, int]:
     code, out = _run_cmd("git diff --numstat --", workdir)
     if code != 0 or not out:
@@ -312,6 +375,37 @@ def _worktree_fingerprint(workdir: Path) -> tuple[int, int, int]:
     files = _effective_changed_files(workdir)
     added, removed = _diff_line_counts(workdir)
     return len(files), added, removed
+
+
+def _repair_attempt_limit(failure_type: str, default_limit: int) -> int:
+    key_map = {
+        "test_failure": "DISCORD_REPAIR_TEST_MAX_ATTEMPTS",
+        "syntax_failure": "DISCORD_REPAIR_SYNTAX_MAX_ATTEMPTS",
+        "permission_failure": "DISCORD_REPAIR_PERMISSION_MAX_ATTEMPTS",
+        "unknown_failure": "DISCORD_REPAIR_UNKNOWN_MAX_ATTEMPTS",
+    }
+    key = key_map.get(failure_type)
+    if key is None:
+        return max(1, default_limit)
+    return max(1, _env_int(key, default_limit))
+
+
+def _repair_stagnant_limit(failure_type: str) -> int:
+    key_map = {
+        "test_failure": "DISCORD_REPAIR_TEST_STAGNANT_LIMIT",
+        "syntax_failure": "DISCORD_REPAIR_SYNTAX_STAGNANT_LIMIT",
+        "permission_failure": "DISCORD_REPAIR_PERMISSION_STAGNANT_LIMIT",
+        "unknown_failure": "DISCORD_REPAIR_UNKNOWN_STAGNANT_LIMIT",
+    }
+    default_map = {
+        "test_failure": 2,
+        "syntax_failure": 1,
+        "permission_failure": 1,
+        "unknown_failure": 2,
+    }
+    key = key_map.get(failure_type, "DISCORD_REPAIR_UNKNOWN_STAGNANT_LIMIT")
+    default_value = default_map.get(failure_type, 2)
+    return max(1, _env_int(key, default_value))
 
 
 def _evaluate_dod(workdir: Path, validation_ok: bool, alerts: list[str]) -> tuple[bool, str]:
@@ -1295,6 +1389,7 @@ def main() -> int:
             state.profile_note = ""
 
         channel = bot.get_channel(channel_id)
+        started_at = datetime.now(UTC)
         if isinstance(channel, discord.abc.Messageable):
             try:
                 await channel.send(
@@ -1323,6 +1418,15 @@ def main() -> int:
             auto.last_run_at = datetime.now(UTC).isoformat()
             auto.last_final = final
             auto.last_log = run_log
+            guard_ok, guard_report_path = _evaluate_autopilot_guard(workdir, project_root)
+            if not guard_ok:
+                final = "Stopped: autopilot guard violation detected."
+                auto.last_final = final
+                if isinstance(channel, discord.abc.Messageable):
+                    try:
+                        await channel.send(f"autopilotガード違反: {guard_report_path}")
+                    except Exception:
+                        pass
             final_lower = final.lower()
             if any(token in final_lower for token in ("stopped:", "needs_review", "error", "failed")):
                 checklist_path = _write_manual_checklist(project_root, objective, final, run_log)
@@ -1338,15 +1442,50 @@ def main() -> int:
                     )
                 except Exception:
                     pass
+            history_path = _append_autopilot_history(
+                project_root,
+                {
+                    "ts": datetime.now(UTC).isoformat(),
+                    "channel_id": channel_id,
+                    "trigger": trigger,
+                    "objective": objective,
+                    "final": final,
+                    "run_log": run_log,
+                    "duration_seconds": int((datetime.now(UTC) - started_at).total_seconds()),
+                    "success": final.lower().startswith("finished:") and guard_ok,
+                    "guard_ok": guard_ok,
+                    "guard_report": str(guard_report_path),
+                },
+            )
+            if isinstance(channel, discord.abc.Messageable):
+                try:
+                    await channel.send(f"autopilot履歴を更新: {history_path}")
+                except Exception:
+                    pass
             return True, final
         except Exception as exc:
             err = f"error: {type(exc).__name__}: {exc}"
             release_state(state, err)
             auto.last_run_at = datetime.now(UTC).isoformat()
             auto.last_final = err
+            history_path = _append_autopilot_history(
+                project_root,
+                {
+                    "ts": datetime.now(UTC).isoformat(),
+                    "channel_id": channel_id,
+                    "trigger": trigger,
+                    "objective": objective,
+                    "final": err,
+                    "run_log": "",
+                    "duration_seconds": int((datetime.now(UTC) - started_at).total_seconds()),
+                    "success": False,
+                    "guard_ok": False,
+                    "guard_report": "",
+                },
+            )
             if isinstance(channel, discord.abc.Messageable):
                 try:
-                    await channel.send(f"autopilotエラー: {err}")
+                    await channel.send(f"autopilotエラー: {err}\nhistory={history_path}")
                 except Exception:
                     pass
             return False, err
@@ -1485,6 +1624,9 @@ def main() -> int:
         if not is_allowed_channel(ctx.channel.id):
             return
         auto = get_autopilot_state(ctx.channel.id)
+        history = _tail_autopilot_history(project_root, limit=20)
+        success_count = sum(1 for row in history if bool(row.get("success")))
+        fail_count = len(history) - success_count
         await ctx.reply(
             "autopilot状態\n"
             f"enabled={auto.enabled}\n"
@@ -1494,7 +1636,8 @@ def main() -> int:
             f"last_final={auto.last_final or '(none)'}\n"
             f"last_log={auto.last_log or '(none)'}\n"
             f"last_daily_summary_date={auto.last_daily_summary_date or '(none)'}\n"
-            f"last_daily_summary_path={auto.last_daily_summary_path or '(none)'}"
+            f"last_daily_summary_path={auto.last_daily_summary_path or '(none)'}\n"
+            f"history_recent={len(history)} success={success_count} fail={fail_count}"
         )
 
     @bot.command(name="auto_now")
@@ -1877,6 +2020,7 @@ def main() -> int:
             impl_final = ""
             repair_strategies: list[str] = []
             stagnant_repair_count = 0
+            repair_type_counts: dict[str, int] = {}
             progress_hook("phase=implement")
             impl_final, impl_log, impl_note = _run_agent_job(
                 project_root=project_root,
@@ -1910,6 +2054,14 @@ def main() -> int:
                 attempt += 1
                 failure_type = _classify_validation_failure(report)
                 repair_strategies.append(failure_type)
+                repair_type_counts[failure_type] = repair_type_counts.get(failure_type, 0) + 1
+                type_limit = _repair_attempt_limit(failure_type, max_repair_loops)
+                if repair_type_counts[failure_type] > type_limit:
+                    progress_hook(
+                        "repair_stop=type_attempt_limit "
+                        f"failure_type={failure_type} limit={type_limit}"
+                    )
+                    break
                 progress_hook(f"phase=repair attempt={attempt}")
                 progress_hook(f"repair_strategy={failure_type}")
                 fix_objective = _build_repair_objective_with_stagnation_note(
@@ -1949,8 +2101,12 @@ def main() -> int:
                 if not ok and failure_type == "permission_failure":
                     progress_hook("repair_stop=permission_failure requires manual intervention")
                     break
-                if not ok and stagnant_repair_count >= 2:
-                    progress_hook("repair_stop=stagnant_repair detected; requires manual review")
+                stagnant_limit = _repair_stagnant_limit(failure_type)
+                if not ok and stagnant_repair_count >= stagnant_limit:
+                    progress_hook(
+                        "repair_stop=stagnant_repair "
+                        f"failure_type={failure_type} limit={stagnant_limit}"
+                    )
                     break
 
             summary_path = _write_summary_template(
@@ -2005,6 +2161,7 @@ def main() -> int:
                 f"pr_ready={pr_ready_path}\n"
                 f"repair_attempts={attempt}/{max_repair_loops}\n"
                 f"repair_strategies={','.join(repair_strategies) if repair_strategies else '(none)'}\n"
+                f"repair_type_counts={repair_type_counts}\n"
                 f"repair_stagnant_count={stagnant_repair_count}\n"
                 f"validation_alerts={len(alerts)}\n"
                 f"review_status={'OK' if review_ok else 'NOT_OK'}"

@@ -174,6 +174,8 @@ python -m agent.discord_bot --workdir /Users/tanaka/ai-cli-agent
 - autopilot は安全のため `read_file/write_file/finish` のみ使用（`shell` は禁止）
 - autopilot の書き込み先は `runs/*.md` のみに制限
 - autopilot 失敗時は `runs/manual_checklist.md` を自動生成
+- autopilot 実行履歴は `.agent_state/autopilot_history.jsonl` に保存
+- autopilot 変更にもガードレポート (`runs/autopilot_guard_report.md`) を適用
 - `supervise` の tester はプロジェクト種別を自動判定し、Pythonプロジェクトでは `pytest/compileall` 系のみ許可
 
 4. Optional Discord runtime env:
@@ -191,8 +193,14 @@ DISCORD_ENFORCE_APPROVE_BRANCH=true
 DISCORD_AUTOPILOT_INTERVAL_SECONDS=900
 DISCORD_AUTOPILOT_MAX_STEPS=8
 DISCORD_AUTOPILOT_OBJECTIVES=リポジトリ状態を確認して runs/auto_todo.md を更新してfinish||直近runログを要約して runs/auto_health.md を更新してfinish
+DISCORD_AUTOPILOT_MAX_CHANGED_FILES=20
+DISCORD_AUTOPILOT_ALLOWED_PREFIXES=runs/
 OPENAI_TRANSCRIBE_MODEL=gpt-4o-mini-transcribe
 DISCORD_VOICE_MAX_MB=30
+DISCORD_REPAIR_TEST_MAX_ATTEMPTS=3
+DISCORD_REPAIR_SYNTAX_MAX_ATTEMPTS=2
+DISCORD_REPAIR_PERMISSION_MAX_ATTEMPTS=1
+DISCORD_REPAIR_UNKNOWN_MAX_ATTEMPTS=2
 ```
 
 - `allow`: non-safe shell/external calls are allowed automatically
@@ -211,8 +219,11 @@ DISCORD_VOICE_MAX_MB=30
 - `DISCORD_AUTOPILOT_MAX_STEPS` は autopilot 1回あたりのステップ上限
 - `DISCORD_AUTOPILOT_OBJECTIVES` は autopilot の定型目標（`||` 区切り）
 - `!auto_set` で設定した目標は `.agent_state/autopilot_objectives.txt` に保存され、次回起動時も再利用
+- `DISCORD_AUTOPILOT_MAX_CHANGED_FILES` は autopilot 実行後の変更ファイル上限
+- `DISCORD_AUTOPILOT_ALLOWED_PREFIXES` は autopilot で変更を許可するパス接頭辞（`,` 区切り）
 - `OPENAI_TRANSCRIBE_MODEL` は音声文字起こしモデル（既定: `gpt-4o-mini-transcribe`）
 - `DISCORD_VOICE_MAX_MB` は音声添付サイズ上限（MB）
+- `DISCORD_REPAIR_*_MAX_ATTEMPTS` は失敗タイプ別の修復試行上限
 
 Additional runtime safeguards:
 
