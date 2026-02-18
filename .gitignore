@@ -23,3 +23,6 @@ path/to/
 
 # OS/editor noise
 .DS_Store
+
+# Accidental top-level reports
+DoD_report.txt
